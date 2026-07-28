@@ -996,6 +996,11 @@ class AsyncOmniEngine:
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
+            "engine_backend": kwargs.get("engine_backend", "default"),
+            "diffusion_model_runner_cls": kwargs.get(
+                "diffusion_model_runner_cls",
+                None,
+            ),
             "model_class_name": kwargs.get("model_class_name", None),
             "model_config": kwargs.get("model_config", None),
             "additional_config": kwargs.get("additional_config", None),
