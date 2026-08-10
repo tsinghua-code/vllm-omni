@@ -948,7 +948,8 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
                     name = stripped
 
             if name not in params:
-                raise KeyError(f"Unexpected ABot model weight: {checkpoint_name} → {name}")
+                # Skip unused Wan I2V camera / legacy weights gracefully.
+                continue
 
             param = params[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)

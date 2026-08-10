@@ -773,5 +773,23 @@ class ABotWorldCausalPipeline(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return cast(set[str], loader.load_weights(weights))
+        """Forward transformer-relevant weights to the transformer; skip extras."""
+        import logging
+        _logger = logging.getLogger(__name__)
+
+        # All transformer weights in this checkpoint use the "model." prefix.
+        # Delegate to the transformer's own load_weights which handles QKV
+        # fusion, TP sharding, and prefix stripping.
+        transformer_weights: list[tuple[str, torch.Tensor]] = []
+        skipped = 0
+        for name, tensor in weights:
+            if name.startswith("model."):
+                transformer_weights.append((name, tensor))
+            else:
+                _logger.debug("Skipping non-transformer weight: %s", name)
+                skipped += 1
+        if skipped:
+            _logger.info("Skipped %d non-transformer weights (VAE/text encoder loaded separately)", skipped)
+
+        loaded = self.transformer.load_weights(transformer_weights)
+        return loaded
