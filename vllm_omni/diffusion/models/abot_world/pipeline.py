@@ -321,17 +321,23 @@ class ABotWorldCausalPipeline(
         tokenizer_path = os.path.join(model, "google", "umt5-xxl")
         encoder_pth = os.path.join(model, "models_t5_umt5-xxl-enc-bf16.pth")
 
+        # Prefer local config + bundled .pth to avoid HF download.
         if os.path.isdir(tokenizer_path) and os.path.isfile(os.path.join(tokenizer_path, "config.json")):
-            # ABot-World ships config in google/umt5-xxl but weights in a
-            # standalone .pth file — construct from config, then load weights.
             config = AutoConfig.from_pretrained(tokenizer_path, local_files_only=True)
             text_encoder = UMT5EncoderModel(config)
             if os.path.isfile(encoder_pth):
                 state_dict = torch.load(encoder_pth, map_location="cpu", weights_only=True)
                 text_encoder.load_state_dict(state_dict, strict=False)
+        elif os.path.isfile(encoder_pth):
+            # Config not available locally — download it, then override weights.
+            text_encoder = UMT5EncoderModel.from_pretrained(
+                "google/umt5-xxl", torch_dtype=dtype,
+            )
+            state_dict = torch.load(encoder_pth, map_location="cpu", weights_only=True)
+            text_encoder.load_state_dict(state_dict, strict=False)
         else:
             text_encoder = UMT5EncoderModel.from_pretrained(
-                "google/umt5-xxl", torch_dtype=dtype, local_files_only=local_files_only,
+                "google/umt5-xxl", torch_dtype=dtype,
             )
         return text_encoder
 
