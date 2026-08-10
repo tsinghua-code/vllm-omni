@@ -336,17 +336,60 @@ class ABotWorldCausalPipeline(
         return text_encoder
 
     def _load_vae(self, model: str, dtype: torch.dtype, local_files_only: bool) -> DistributedAutoencoderKLWan:
-        # Use standard Wan 2.2 VAE (same as ABot-World)
-        try:
-            return DistributedAutoencoderKLWan.from_pretrained(
-                "Wan-AI/Wan2.2-TI2V-5B-Diffusers", subfolder="vae",
-                torch_dtype=dtype, local_files_only=local_files_only,
-            )
-        except Exception:
-            return DistributedAutoencoderKLWan.from_pretrained(
-                "Wan-AI/Wan2.2-T2V-A14B-Diffusers", subfolder="vae",
-                torch_dtype=dtype, local_files_only=local_files_only,
-            )
+        # ABot-World checkpoint has Wan2.2_VAE.pth (flat weights, no diffusers config).
+        # Try local HF cache first, then try the bundled .pth, then try download.
+        vae_pth = os.path.join(model, "Wan2.2_VAE.pth")
+        if os.path.isfile(vae_pth):
+            try:
+                return self._load_vae_from_local_pth(vae_pth, dtype)
+            except Exception:
+                pass
+        # Fall back to HuggingFace (cached or download).
+        for repo in ("Wan-AI/Wan2.2-TI2V-5B-Diffusers", "Wan-AI/Wan2.2-T2V-A14B-Diffusers"):
+            try:
+                return DistributedAutoencoderKLWan.from_pretrained(
+                    repo, subfolder="vae", torch_dtype=dtype,
+                )
+            except Exception:
+                continue
+        raise FileNotFoundError(
+            "Cannot load Wan2.2 VAE. Ensure network access to HuggingFace or "
+            f"place a valid vae/ config alongside {vae_pth}."
+        )
+
+    @staticmethod
+    def _load_vae_from_local_pth(vae_pth: str, dtype: torch.dtype) -> DistributedAutoencoderKLWan:
+        """Load Wan2.2 VAE from a standalone .pth checkpoint by constructing
+        a minimal compatible config inline."""
+        from diffusers.models.autoencoders import AutoencoderKLWan
+
+        # Wan2.2 VAE config (matches the checkpoint bundled with ABot-World).
+        vae_config = {
+            "_class_name": "AutoencoderKLWan",
+            "in_channels": 3,
+            "out_channels": 3,
+            "latent_channels": 48,
+            "down_block_types": ("WanResnetDownsampleBlock3D",) * 4,
+            "up_block_types": ("WanResnetUpsampleBlock3D",) * 4,
+            "block_out_channels": (128, 256, 512, 512),
+            "layers_per_block": 2,
+            "act_fn": "silu",
+            "scaling_factor": 0.4769,
+            "latents_mean": None,
+            "latents_std": None,
+            "norm_num_groups": 32,
+            "shift_factor": None,
+            "temporal_compression_ratio": 4,
+            "spatial_compression_ratio": 8,
+            "use_parallel_blocks": True,
+            "mid_block_add_conv": True,
+        }
+        vae = DistributedAutoencoderKLWan.from_config(vae_config)
+        state_dict = torch.load(vae_pth, map_location="cpu", weights_only=True)
+        vae.load_state_dict(state_dict, strict=False)
+        vae = vae.to(dtype=dtype)
+        vae.init_distributed()
+        return vae
 
     def _create_transformer(self, model: str, local_files_only: bool) -> ABotWorldCausalTransformer3DModel:
         import json
