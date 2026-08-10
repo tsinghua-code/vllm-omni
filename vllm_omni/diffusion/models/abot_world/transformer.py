@@ -26,15 +26,38 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.norm import LayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
-from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
-    WanTimeTextImageEmbedding,
-    WanTransformerBlock,
-    _sinusoidal_embedding,
-    _rope_axis,
-)
 
 # Re-export these symbols so registry detection works correctly.
 _WAN_PACKED_MODULES = {"to_qkv": ["to_q", "to_k", "to_v"]}
+
+
+# ── Inline helpers (avoid importing private symbols from wan2_2_transformer) ──
+
+def _sinusoidal_embedding(dim: int, timestep: torch.Tensor) -> torch.Tensor:
+    if dim % 2:
+        raise ValueError(f"freq_dim must be even, got {dim}.")
+    half_dim = dim // 2
+    timestep = timestep.to(torch.float64)
+    frequencies = torch.pow(
+        10000,
+        -torch.arange(half_dim, device=timestep.device, dtype=torch.float64) / half_dim,
+    )
+    phase = torch.outer(timestep, frequencies)
+    return torch.cat((phase.cos(), phase.sin()), dim=1)
+
+
+def _rope_axis(max_seq_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if dim == 0:
+        empty = torch.empty(max_seq_len, 0, dtype=torch.float32)
+        return empty, empty.clone()
+    if dim % 2:
+        raise ValueError(f"RoPE axis dimension must be even, got {dim}.")
+    frequencies = 1.0 / torch.pow(
+        10000,
+        torch.arange(0, dim, 2, dtype=torch.float64) / dim,
+    )
+    phase = torch.outer(torch.arange(max_seq_len, dtype=torch.float64), frequencies)
+    return phase.cos().float(), phase.sin().float()
 
 
 def _projection_prefix(prefix: str, name: str) -> str:
