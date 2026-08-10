@@ -589,8 +589,8 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         model.blocks.<n>.ffn.0/2.*
         model.blocks.<n>.scale_shift_table
         model.c2ws_hidden_states_layer1/layer2.*  (unused by ABot, loaded for compat)
-        model.control_adapter.control_in_layer.*
-        model.control_adapter.residual.*
+        model.act_control_adapter.control_in_layer.*
+        model.act_control_adapter.residual.*
         model.head.*
         model.time_embedding.*
         model.time_projection.*
@@ -644,7 +644,7 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         )
 
         # Control adapter (action conditioning)
-        self.control_adapter = ABotSimpleAdapter(dim)
+        self.act_control_adapter = ABotSimpleAdapter(dim)
 
         # Time and text condition embeddings
         self.time_embedding = nn.Sequential(
@@ -866,7 +866,7 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
 
         # Apply action control adapter
         if action_condition is not None:
-            hidden_states = self.control_adapter(
+            hidden_states = self.act_control_adapter(
                 hidden_states, action_condition,
                 num_frames=patched_frames,
                 spatial_tokens=tokens_per_frame,
