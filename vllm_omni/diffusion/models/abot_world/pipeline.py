@@ -316,15 +316,23 @@ class ABotWorldCausalPipeline(
         )
 
     def _load_text_encoder(self, model: str, dtype: torch.dtype, local_files_only: bool) -> UMT5EncoderModel:
+        from transformers import AutoConfig
+
         tokenizer_path = os.path.join(model, "google", "umt5-xxl")
         encoder_pth = os.path.join(model, "models_t5_umt5-xxl-enc-bf16.pth")
-        if os.path.isdir(tokenizer_path):
-            text_encoder = UMT5EncoderModel.from_pretrained(tokenizer_path, torch_dtype=dtype, local_files_only=True)
+
+        if os.path.isdir(tokenizer_path) and os.path.isfile(os.path.join(tokenizer_path, "config.json")):
+            # ABot-World ships config in google/umt5-xxl but weights in a
+            # standalone .pth file — construct from config, then load weights.
+            config = AutoConfig.from_pretrained(tokenizer_path, local_files_only=True)
+            text_encoder = UMT5EncoderModel(config)
+            if os.path.isfile(encoder_pth):
+                state_dict = torch.load(encoder_pth, map_location="cpu", weights_only=True)
+                text_encoder.load_state_dict(state_dict, strict=False)
         else:
-            text_encoder = UMT5EncoderModel.from_pretrained("google/umt5-xxl", torch_dtype=dtype, local_files_only=local_files_only)
-        if os.path.isfile(encoder_pth):
-            state_dict = torch.load(encoder_pth, map_location="cpu", weights_only=True)
-            text_encoder.load_state_dict(state_dict, strict=False)
+            text_encoder = UMT5EncoderModel.from_pretrained(
+                "google/umt5-xxl", torch_dtype=dtype, local_files_only=local_files_only,
+            )
         return text_encoder
 
     def _load_vae(self, model: str, dtype: torch.dtype, local_files_only: bool) -> DistributedAutoencoderKLWan:
