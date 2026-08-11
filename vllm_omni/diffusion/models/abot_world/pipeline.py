@@ -321,20 +321,16 @@ class ABotWorldCausalPipeline(
         tokenizer_path = os.path.join(model, "google", "umt5-xxl")
         encoder_pth = os.path.join(model, "models_t5_umt5-xxl-enc-bf16.pth")
 
-        # Try local config first
-        if os.path.isdir(tokenizer_path) and os.path.isfile(os.path.join(tokenizer_path, "config.json")):
-            from transformers import AutoConfig
-            config = AutoConfig.from_pretrained(tokenizer_path, local_files_only=True)
-        else:
-            # Hardcoded UMT5-XXL config for fully offline environments
-            config = T5Config(
-                d_model=4096, d_kv=64, d_ff=10240, num_layers=24,
-                num_decoder_layers=24, num_heads=64, relative_attention_num_buckets=32,
-                relative_attention_max_distance=128, dropout_rate=0.0,
-                layer_norm_epsilon=1e-06, feed_forward_proj="gated-gelu",
-                is_encoder_decoder=True, use_cache=True, tokenizer_class="T5Tokenizer",
-                tie_word_embeddings=False, pad_token_id=0, decoder_start_token_id=0,
-            )
+        # UMT5-XXL encoder-only config (is_encoder_decoder=False is critical
+        # to avoid causal mask computation in the encoder).
+        config = T5Config(
+            d_model=4096, d_kv=64, d_ff=10240, num_layers=24,
+            num_decoder_layers=0, num_heads=64, relative_attention_num_buckets=32,
+            relative_attention_max_distance=128, dropout_rate=0.0,
+            layer_norm_epsilon=1e-06, feed_forward_proj="gated-gelu",
+            is_encoder_decoder=False,
+            pad_token_id=0, vocab_size=256384,
+        )
 
         text_encoder = UMT5EncoderModel(config)
         if os.path.isfile(encoder_pth):
