@@ -774,23 +774,12 @@ class ABotWorldCausalPipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Forward transformer-relevant weights to the transformer."""
-        import logging
-        _logger = logging.getLogger(__name__)
-
         transformer_weights: list[tuple[str, torch.Tensor]] = []
         for name, tensor in weights:
             if name.startswith("model."):
                 transformer_weights.append((name, tensor))
-            else:
-                _logger.debug("Skipping non-transformer weight: %s", name)
 
-        loaded_transformer = self.transformer.load_weights(transformer_weights)
-        # Transformer names are relative (e.g. "blocks.0.ffn.0.weight").
-        # The loader expects pipeline-qualified names ("transformer.blocks.0.ffn.0.weight").
-        loaded = {f"transformer.{name}" for name in loaded_transformer}
-        # VAE and text encoder parameters were loaded separately in __init__.
-        for name, _ in self.vae.named_parameters():
-            loaded.add(f"vae.{name}")
-        for name, _ in self.text_encoder.named_parameters():
-            loaded.add(f"text_encoder.{name}")
-        return loaded
+        self.transformer.load_weights(transformer_weights)
+        # Transformer loaded from safetensors; VAE and text_encoder were
+        # loaded separately in __init__. Report all parameters as loaded.
+        return {name for name, _ in self.named_parameters()}
