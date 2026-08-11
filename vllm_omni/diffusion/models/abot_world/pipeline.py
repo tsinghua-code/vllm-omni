@@ -233,6 +233,44 @@ def _convert_wan_umt5_encoder_state_dict(
     return converted
 
 
+def _fix_wan22_residual_vae_keys(
+    source: dict[str, torch.Tensor], converted: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """Restore Wan2.2 residual block nesting lost by Diffusers' converter."""
+    converted = {
+        key: value
+        for key, value in converted.items()
+        if not key.startswith(("encoder.down_blocks.", "decoder.up_blocks."))
+    }
+    tail_replacements = {
+        "residual.0.": "norm1.",
+        "residual.2.": "conv1.",
+        "residual.3.": "norm2.",
+        "residual.6.": "conv2.",
+        "shortcut.": "conv_shortcut.",
+    }
+
+    for key, value in source.items():
+        parts = key.split(".")
+        if len(parts) < 6:
+            continue
+        if parts[:2] == ["encoder", "downsamples"] and parts[3] == "downsamples":
+            block, layer, tail = parts[2], int(parts[4]), ".".join(parts[5:])
+            component = f"resnets.{layer}" if layer < 2 else "downsampler"
+            prefix = f"encoder.down_blocks.{block}.{component}."
+        elif parts[:2] == ["decoder", "upsamples"] and parts[3] == "upsamples":
+            block, layer, tail = parts[2], int(parts[4]), ".".join(parts[5:])
+            component = f"resnets.{layer}" if layer < 3 else "upsampler"
+            prefix = f"decoder.up_blocks.{block}.{component}."
+        else:
+            continue
+        for old, new in tail_replacements.items():
+            tail = tail.replace(old, new)
+        converted[prefix + tail] = value
+
+    return converted
+
+
 def _positive_finite_flow_shift(value: Any) -> float:
     if isinstance(value, bool):
         raise ValueError("flow_shift must be a positive finite number.")
@@ -536,7 +574,9 @@ class ABotWorldCausalPipeline(
         state_dict = torch.load(vae_pth, map_location="cpu", weights_only=True)
         if isinstance(state_dict, dict) and isinstance(state_dict.get("state_dict"), dict):
             state_dict = state_dict["state_dict"]
-        converted = convert_wan_vae_to_diffusers(state_dict)
+        converted = _fix_wan22_residual_vae_keys(
+            state_dict, convert_wan_vae_to_diffusers(state_dict)
+        )
         with torch.device("meta"):
             vae = DistributedAutoencoderKLWan.from_config(vae_config)
         vae.load_state_dict(converted, strict=True, assign=True)

@@ -15,6 +15,7 @@ from vllm_omni.diffusion.models.abot_world.pipeline import (
     _DEFAULT_WIDTH,
     _build_shifted_flow_schedule,
     _convert_wan_umt5_encoder_state_dict,
+    _fix_wan22_residual_vae_keys,
     _paged_kv_tokens_per_frame,
     _positive_finite_flow_shift,
     _resolve_local_model_path,
@@ -128,6 +129,31 @@ def test_umt5_conversion_maps_gated_gelu_branches() -> None:
     assert converted[
         "encoder.block.0.layer.1.DenseReluDense.wi_1.weight"
     ].item() == suffixes.index("ffn.fc1.weight")
+
+
+def test_wan22_residual_vae_conversion_preserves_grouped_blocks() -> None:
+    source = {
+        "encoder.downsamples.0.downsamples.0.residual.0.gamma": torch.tensor(0),
+        "encoder.downsamples.0.downsamples.2.resample.1.weight": torch.tensor(1),
+        "decoder.upsamples.0.upsamples.2.shortcut.weight": torch.tensor(2),
+        "decoder.upsamples.0.upsamples.3.time_conv.weight": torch.tensor(3),
+    }
+    converted = _fix_wan22_residual_vae_keys(
+        source,
+        {
+            "encoder.down_blocks.0.downsamples.0.norm1.gamma": torch.tensor(-1),
+            "decoder.up_blocks.0.resnets.0.norm1.gamma": torch.tensor(-1),
+            "quant_conv.weight": torch.tensor(4),
+        },
+    )
+
+    assert set(converted) == {
+        "encoder.down_blocks.0.resnets.0.norm1.gamma",
+        "encoder.down_blocks.0.downsampler.resample.1.weight",
+        "decoder.up_blocks.0.resnets.2.conv_shortcut.weight",
+        "decoder.up_blocks.0.upsampler.time_conv.weight",
+        "quant_conv.weight",
+    }
 
 
 def test_from_config_uses_wan_text_width_not_text_length() -> None:
