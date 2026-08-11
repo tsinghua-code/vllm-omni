@@ -524,8 +524,17 @@ class ABotWorldCausalPipeline(
 
     def _vae_latent_stats(self, ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         shape = (1, -1, 1, 1, 1)
-        mean = torch.as_tensor(self.vae.config.latents_mean, device=ref.device, dtype=ref.dtype).view(*shape)
-        std = torch.as_tensor(self.vae.config.latents_std, device=ref.device, dtype=ref.dtype).view(*shape)
+        # Read from buffer (populated by load_state_dict), fall back to config
+        mean_val = getattr(self.vae, "latents_mean", None)
+        if mean_val is None:
+            mean_val = self.vae.config.latents_mean
+        std_val = getattr(self.vae, "latents_std", None)
+        if std_val is None:
+            std_val = self.vae.config.latents_std
+        if mean_val is None or std_val is None:
+            return torch.as_tensor(0.0, device=ref.device, dtype=ref.dtype), torch.as_tensor(1.0, device=ref.device, dtype=ref.dtype)
+        mean = torch.as_tensor(mean_val, device=ref.device, dtype=ref.dtype).view(*shape)
+        std = torch.as_tensor(std_val, device=ref.device, dtype=ref.dtype).view(*shape)
         return mean, std
 
     def _encode_first_frame(self, image: PIL.Image.Image | torch.Tensor, height: int, width: int,
