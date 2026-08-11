@@ -30,6 +30,8 @@ _MODEL = "acvlab/ABot-World-0-5B-LF"
 _CAMERA_ACTION_SCHEMA = "abot.camera_actions.v1"
 _FRAMES_PER_BLOCK = 3
 _MAX_REALTIME_TICKS = 10
+_VAE_DIT_SPATIAL_FACTOR = 32
+_PAGED_KV_BLOCK_ALIGNMENT = 16
 
 
 def _camera_event_data(frames: list[list[str]]) -> dict[str, Any]:
@@ -45,7 +47,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="JSONL file with one prompt/action event per AR block.")
     parser.add_argument("--output-dir", required=True, help="Directory for chunk latents and metadata.")
     parser.add_argument("--session-id", default="abot-world", help="Persistent world session identifier.")
-    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.1)
@@ -102,6 +104,14 @@ def _validate_args(args: argparse.Namespace) -> tuple[Path, Path, Path]:
         raise ValueError("--prompt must contain non-whitespace text.")
     if args.height <= 0 or args.width <= 0 or args.height % 32 or args.width % 32:
         raise ValueError("--height and --width must be positive multiples of 32.")
+    tokens_per_frame = (
+        args.height // _VAE_DIT_SPATIAL_FACTOR
+    ) * (args.width // _VAE_DIT_SPATIAL_FACTOR)
+    if tokens_per_frame % _PAGED_KV_BLOCK_ALIGNMENT:
+        raise ValueError(
+            "FlashAttention paged KV requires tokens per frame to be a multiple "
+            f"of 16; got {tokens_per_frame}. Use --height 512 --width 832."
+        )
     if args.tensor_parallel_size <= 0:
         raise ValueError("--tensor-parallel-size must be positive.")
     if not math.isfinite(args.gpu_memory_fraction) or not 0 < args.gpu_memory_fraction <= 1:

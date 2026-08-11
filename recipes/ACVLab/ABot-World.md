@@ -18,15 +18,28 @@ The checkpoint is Apache-2.0 licensed. The vLLM-Omni integration code is also Ap
 The offline path consumes one source image and generates a video:
 
 ```bash
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export DIFFUSERS_OFFLINE=1
+
 python examples/offline_inference/diffusion/abot_world.py \
-  --model acvlab/ABot-World-0-5B-LF \
+  --model /path/to/ABot-World-0-5B-LF \
   --image /path/to/first_frame.png \
   --prompt "The camera moves slowly forward through the scene." \
-  --num-frames 31 \
+  --num-frames 9 \
+  --height 512 \
+  --width 832 \
   --output abot_world_output.mp4
 ```
 
-Raw frame counts must be `9 + 12k` (e.g., 9, 21, 33, 81, 117, 121), up to 121 frames.
+The bundled Wan2.2 VAE compresses space by 16 and the DiT applies a 2x2
+spatial patch, so 512x832 produces 16x26 = 416 tokens per latent frame. The
+FlashAttention paged-KV kernel requires this page size to be a multiple of 16.
+480x832 (390 tokens) and 448x832 (364 tokens) are therefore rejected before
+model execution.
+
+Raw frame counts must be `9 + 12k` (9, 21, 33, ..., 117), up to 117 frames.
 
 ## Realtime in-process generation
 
@@ -43,11 +56,13 @@ Run:
 
 ```bash
 python examples/offline_inference/diffusion/abot_world_realtime.py \
-  --model acvlab/ABot-World-0-5B-LF \
+  --model /path/to/ABot-World-0-5B-LF \
   --image /path/to/first_frame.png \
   --prompt "Initial scene" \
   --events /path/to/events.jsonl \
   --output-dir /tmp/abot-realtime \
+  --height 512 \
+  --width 832 \
   --gpu-memory-fraction 0.6
 ```
 

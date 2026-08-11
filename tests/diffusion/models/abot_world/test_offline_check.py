@@ -11,10 +11,14 @@ import torch
 
 from vllm_omni.diffusion.models.abot_world.pipeline import (
     ABOT_DMD_TIMESTEPS,
+    _DEFAULT_HEIGHT,
+    _DEFAULT_WIDTH,
     _build_shifted_flow_schedule,
     _convert_wan_umt5_encoder_state_dict,
+    _paged_kv_tokens_per_frame,
     _positive_finite_flow_shift,
     _resolve_local_model_path,
+    _validate_latent_channel_contract,
     _validate_local_model_files,
 )
 from vllm_omni.diffusion.models.abot_world.transformer import (
@@ -22,6 +26,52 @@ from vllm_omni.diffusion.models.abot_world.transformer import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_default_resolution_is_flash_attention_page_aligned() -> None:
+    tokens_per_frame = _paged_kv_tokens_per_frame(
+        _DEFAULT_HEIGHT,
+        _DEFAULT_WIDTH,
+        vae_scale_factor=16,
+        patch_height=2,
+        patch_width=2,
+    )
+
+    assert (_DEFAULT_HEIGHT, _DEFAULT_WIDTH) == (512, 832)
+    assert tokens_per_frame == 416
+    assert tokens_per_frame % 16 == 0
+
+
+@pytest.mark.parametrize(
+    ("height", "expected_tokens"),
+    [(480, 390), (448, 364)],
+)
+def test_unaligned_paged_kv_resolutions_are_rejected(
+    height: int, expected_tokens: int
+) -> None:
+    with pytest.raises(ValueError, match=rf"got {expected_tokens} for"):
+        _paged_kv_tokens_per_frame(
+            height,
+            832,
+            vae_scale_factor=16,
+            patch_height=2,
+            patch_width=2,
+        )
+
+
+def test_wan22_vae_requires_48_channel_transformer_contract() -> None:
+    _validate_latent_channel_contract(
+        vae_z_dim=48,
+        transformer_in_channels=48,
+        transformer_out_channels=48,
+    )
+
+    with pytest.raises(ValueError, match="VAE z_dim=16.*48/48"):
+        _validate_latent_channel_contract(
+            vae_z_dim=16,
+            transformer_in_channels=48,
+            transformer_out_channels=48,
+        )
 
 
 def test_shifted_flow_schedule_is_finite_and_monotonic() -> None:

@@ -63,13 +63,75 @@ _MAX_RAW_FRAMES = 117
 _MAX_SEQUENCE_LENGTH = 512
 _REFERENCE_RESOLUTION = 512
 _MAX_SOURCE_IMAGE_PIXELS = 4096 * 4096
-_DEFAULT_HEIGHT = 480
+_DEFAULT_HEIGHT = 512
 _DEFAULT_WIDTH = 832
+_PAGED_KV_BLOCK_ALIGNMENT = 16
 _SOURCE_IMAGE_ERROR = (
     "Unable to load multi_modal_data.image; expected a decodable image within 4096 * 4096 source pixels."
 )
 _PREPROCESSED_ACTION_KEY = "_abot_camera_actions"
 _ACTION_CONTROL_DIM = 32
+
+
+def _paged_kv_tokens_per_frame(
+    height: int,
+    width: int,
+    *,
+    vae_scale_factor: int,
+    patch_height: int,
+    patch_width: int,
+) -> int:
+    """Return one frame's DiT token count and enforce FA page alignment."""
+    divisor_h = vae_scale_factor * patch_height
+    divisor_w = vae_scale_factor * patch_width
+    if height % divisor_h or width % divisor_w:
+        raise ValueError(
+            "height/width must align with the VAE and DiT patch sizes: "
+            f"height must be divisible by {divisor_h}, width by {divisor_w}."
+        )
+    tokens_per_frame = (height // divisor_h) * (width // divisor_w)
+    if tokens_per_frame % _PAGED_KV_BLOCK_ALIGNMENT:
+        raise ValueError(
+            "ABot FlashAttention paged KV requires tokens_per_frame to be a "
+            f"multiple of {_PAGED_KV_BLOCK_ALIGNMENT}, got {tokens_per_frame} "
+            f"for {height}x{width}. Use 512x832 for the bundled Wan2.2 VAE."
+        )
+    return tokens_per_frame
+
+
+def _validate_latent_channel_contract(
+    *,
+    vae_z_dim: int,
+    transformer_in_channels: int,
+    transformer_out_channels: int,
+) -> None:
+    """Reject a Wan VAE/DiT mismatch before the first expensive forward."""
+    if vae_z_dim != transformer_in_channels or vae_z_dim != transformer_out_channels:
+        raise ValueError(
+            "ABot latent channel mismatch: "
+            f"VAE z_dim={vae_z_dim}, transformer in/out="
+            f"{transformer_in_channels}/{transformer_out_channels}. "
+            "ABot-World-0-5B-LF requires the 48-channel Wan2.2 TI2V-5B VAE."
+        )
+
+
+def _validate_latent_tensor(
+    latent: torch.Tensor,
+    *,
+    expected_channels: int,
+    source: str,
+) -> None:
+    if latent.ndim != 5:
+        raise RuntimeError(
+            f"{source} must produce [batch, channels, frames, height, width], "
+            f"got shape {tuple(latent.shape)}."
+        )
+    if latent.shape[1] != expected_channels:
+        raise RuntimeError(
+            f"{source} produced {latent.shape[1]} latent channels, expected "
+            f"{expected_channels} for ABot-World-0-5B-LF. Verify that "
+            "Wan2.2_VAE.pth is the TI2V-5B 48-channel checkpoint."
+        )
 
 
 @dataclass(frozen=True)
@@ -374,6 +436,12 @@ class ABotWorldCausalPipeline(
         # Custom causal transformer
         self.transformer = self._create_transformer(model_path)
 
+        _validate_latent_channel_contract(
+            vae_z_dim=int(self.vae.config.z_dim),
+            transformer_in_channels=int(self.transformer.config.in_channels),
+            transformer_out_channels=int(self.transformer.config.out_channels),
+        )
+
         self.vae_scale_factor_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))
         self.vae_scale_factor_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 16))
         self._num_frame_per_block = 3
@@ -429,6 +497,9 @@ class ABotWorldCausalPipeline(
         """Convert the original Wan2.2 VAE checkpoint to Diffusers names."""
         from diffusers.loaders.single_file_utils import convert_wan_vae_to_diffusers
 
+        # Wan2.2 TI2V patchifies RGB into 12 pixel-space channels (3 * 2 * 2),
+        # while its actual latent width is z_dim=48. Do not substitute the
+        # 16-channel Wan2.1 VAE here.
         vae_config = {
             "_class_name": "AutoencoderKLWan",
             "base_dim": 160,
@@ -490,7 +561,13 @@ class ABotWorldCausalPipeline(
         patch_h, patch_w = cfg.patch_size[1], cfg.patch_size[2]
         spatial = self.vae_scale_factor_spatial
         latent_h, latent_w = self._ar_height // spatial, self._ar_width // spatial
-        tokens_per_frame = (latent_h // patch_h) * (latent_w // patch_w)
+        tokens_per_frame = _paged_kv_tokens_per_frame(
+            self._ar_height,
+            self._ar_width,
+            vae_scale_factor=spatial,
+            patch_height=patch_h,
+            patch_width=patch_w,
+        )
         tp_size = get_tensor_model_parallel_world_size()
         num_local_heads = int(cfg.num_attention_heads) // tp_size
 
@@ -596,9 +673,13 @@ class ABotWorldCausalPipeline(
         if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
             raise ValueError(f"width must be a positive integer, got {width!r}.")
         patch_size = tuple(self.transformer.config.patch_size)
-        div = self.vae_scale_factor_spatial * patch_size[1]
-        if height % div or width % div:
-            raise ValueError(f"height/width must be divisible by {div}.")
+        _paged_kv_tokens_per_frame(
+            height,
+            width,
+            vae_scale_factor=self.vae_scale_factor_spatial,
+            patch_height=patch_size[1],
+            patch_width=patch_size[2],
+        )
 
         num_frames = getattr(sampling, "num_frames", None) or 9
         if isinstance(num_frames, bool) or not isinstance(num_frames, int) or num_frames <= 0:
@@ -692,6 +773,11 @@ class ABotWorldCausalPipeline(
         img = self._prepare_image_tensor(image, height=height, width=width)
         video = img.unsqueeze(2)  # [1, 3, 1, H, W]
         latent = retrieve_latents(self.vae.encode(video.to(dtype=self.vae.dtype)), sample_mode="argmax")
+        _validate_latent_tensor(
+            latent,
+            expected_channels=int(self.transformer.config.in_channels),
+            source="Wan2.2 VAE encode",
+        )
         mean, std = self._vae_latent_stats(latent)
         return ((latent - mean) / std).to(dtype=dtype)
 
@@ -1032,6 +1118,11 @@ class ABotWorldCausalPipeline(
         elif inputs.output_type == "latent":
             output = generated_latents
         else:
+            _validate_latent_tensor(
+                generated_latents,
+                expected_channels=int(self.vae.config.z_dim),
+                source="ABot transformer",
+            )
             mean, std = self._vae_latent_stats(generated_latents)
             vae_latents = (generated_latents * std + mean).to(dtype=self.vae.dtype)
             output = self.vae.decode(vae_latents, return_dict=False)[0]

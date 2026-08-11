@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Run ABot-World offline image-to-video generation.
 
-Usage:
-    python examples/offline_inference/diffusion/abot_world.py \\
+Usage (offline):
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 \\
+    DIFFUSERS_OFFLINE=1 python examples/offline_inference/diffusion/abot_world.py \\
       --model acvlab/ABot-World-0-5B-LF \\
       --image /path/to/first_frame.png \\
       --prompt "The camera moves forward through the scene." \\
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 _MODEL = "acvlab/ABot-World-0-5B-LF"
+_VAE_DIT_SPATIAL_FACTOR = 32
+_PAGED_KV_BLOCK_ALIGNMENT = 16
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -27,7 +30,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--image", required=True, help="Path to the initial RGB image.")
     parser.add_argument("--prompt", required=True, help="Scene description prompt.")
     parser.add_argument("--num-frames", type=int, default=9, help="Number of pixel frames (9+12k, at most 117).")
-    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", required=True, help="Output video file path (MP4).")
@@ -46,6 +49,14 @@ def _validate_args(args: argparse.Namespace) -> tuple[Path, Path]:
         raise ValueError("--image must point to an existing file.")
     if args.height <= 0 or args.width <= 0 or args.height % 32 or args.width % 32:
         raise ValueError("--height and --width must be positive multiples of 32.")
+    tokens_per_frame = (
+        args.height // _VAE_DIT_SPATIAL_FACTOR
+    ) * (args.width // _VAE_DIT_SPATIAL_FACTOR)
+    if tokens_per_frame % _PAGED_KV_BLOCK_ALIGNMENT:
+        raise ValueError(
+            "FlashAttention paged KV requires tokens per frame to be a multiple "
+            f"of 16; got {tokens_per_frame}. Use --height 512 --width 832."
+        )
     if args.num_frames < 9 or args.num_frames > 117 or (args.num_frames - 9) % 12:
         raise ValueError("--num-frames must follow 9+12k and be at most 117 (9, 21, ..., 117).")
     if not args.prompt.strip():
