@@ -24,6 +24,20 @@ _VAE_DIT_SPATIAL_FACTOR = 32
 _PAGED_KV_BLOCK_ALIGNMENT = 16
 
 
+def _extract_video(output: Any) -> Any | None:
+    request_output = getattr(output, "request_output", None)
+    if request_output is not None and getattr(request_output, "images", None):
+        output = request_output
+    images = getattr(output, "images", None)
+    if images is not None and len(images) > 0:
+        return images[0] if len(images) == 1 else images
+    multimodal_output = getattr(output, "multimodal_output", None)
+    if not isinstance(multimodal_output, dict):
+        return None
+    payload = multimodal_output.get("payload")
+    return (payload if isinstance(payload, dict) else multimodal_output).get("video")
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run ABot-World offline image-to-video generation.")
     parser.add_argument("--model", default=_MODEL, help="Hugging Face model ID or local checkpoint path.")
@@ -103,10 +117,9 @@ async def run(argv: Sequence[str] | None = None) -> Path:
             if output.finished and output.stage_id == 0:
                 if output.error:
                     raise RuntimeError(f"Generation failed: {output.error}")
-                video_output = output.multimodal_output
-                if isinstance(video_output, dict):
-                    video = (video_output.get("payload") or {}).get("video")
-                break
+                extracted_video = _extract_video(output)
+                if extracted_video is not None:
+                    video = extracted_video
     finally:
         engine.shutdown()
 

@@ -5,9 +5,12 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
+
+from examples.offline_inference.diffusion.abot_world import _extract_video
 
 from vllm_omni.diffusion.models.abot_world.pipeline import (
     ABOT_DMD_TIMESTEPS,
@@ -152,6 +155,15 @@ def test_abot_head_keeps_bfloat16_through_modulation() -> None:
     )
 
     assert output.dtype == torch.bfloat16
+
+
+def test_offline_example_extracts_standard_diffusion_video_output() -> None:
+    video = object()
+    output = SimpleNamespace(
+        request_output=SimpleNamespace(images=[video]),
+    )
+
+    assert _extract_video(output) is video
     converted = _fix_wan22_residual_vae_keys(
         source,
         {
