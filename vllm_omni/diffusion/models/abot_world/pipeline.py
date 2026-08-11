@@ -280,11 +280,9 @@ class ABotWorldCausalPipeline(
             )
         ]
 
-        # Tokenizer from bundled google/umt5-xxl
+        # Tokenizer from bundled google/umt5-xxl (no HF fallback)
         tokenizer_path = os.path.join(model, "google", "umt5-xxl")
-        if not os.path.isdir(tokenizer_path):
-            tokenizer_path = "google/umt5-xxl"
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=local_files_only)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
 
         # Text encoder
         self.text_encoder = self._load_text_encoder(model, dtype, local_files_only)
@@ -339,26 +337,11 @@ class ABotWorldCausalPipeline(
         return text_encoder
 
     def _load_vae(self, model: str, dtype: torch.dtype, local_files_only: bool) -> DistributedAutoencoderKLWan:
-        # ABot-World checkpoint has Wan2.2_VAE.pth (flat weights, no diffusers config).
-        # Try local HF cache first, then try the bundled .pth, then try download.
+        # Load Wan2.2 VAE from bundled .pth (no HF fallback).
         vae_pth = os.path.join(model, "Wan2.2_VAE.pth")
         if os.path.isfile(vae_pth):
-            try:
-                return self._load_vae_from_local_pth(vae_pth, dtype)
-            except Exception:
-                pass
-        # Fall back to HuggingFace (cached or download).
-        for repo in ("Wan-AI/Wan2.2-TI2V-5B-Diffusers", "Wan-AI/Wan2.2-T2V-A14B-Diffusers"):
-            try:
-                return DistributedAutoencoderKLWan.from_pretrained(
-                    repo, subfolder="vae", torch_dtype=dtype,
-                )
-            except Exception:
-                continue
-        raise FileNotFoundError(
-            "Cannot load Wan2.2 VAE. Ensure network access to HuggingFace or "
-            f"place a valid vae/ config alongside {vae_pth}."
-        )
+            return self._load_vae_from_local_pth(vae_pth, dtype)
+        raise FileNotFoundError(f"Wan2.2_VAE.pth not found at {vae_pth}")
 
     @staticmethod
     def _load_vae_from_local_pth(vae_pth: str, dtype: torch.dtype) -> DistributedAutoencoderKLWan:
