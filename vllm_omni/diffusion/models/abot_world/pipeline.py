@@ -8,25 +8,25 @@ import math
 import os
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+from diffusers.utils.torch_utils import randn_tensor
+from huggingface_hub import snapshot_download
 import numpy as np
 import PIL.Image
+import PIL.ImageOps
 import torch
 import torch.nn.functional as F
-from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoTokenizer, UMT5EncoderModel
+from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import retrieve_latents
@@ -59,7 +59,7 @@ if TYPE_CHECKING:
 
 ABOT_DMD_TIMESTEPS = (1000, 750, 500, 250)
 _WINDOW_FRAMES = 21
-_MAX_RAW_FRAMES = 121
+_MAX_RAW_FRAMES = 117
 _MAX_SEQUENCE_LENGTH = 512
 _REFERENCE_RESOLUTION = 512
 _MAX_SOURCE_IMAGE_PIXELS = 4096 * 4096
@@ -96,6 +96,79 @@ class _ABotARSessionState:
     generator_state: torch.Tensor | None = None
     first_frame_latent: torch.Tensor | None = None
     current_actions: tuple[tuple[str, ...], ...] | None = None
+
+
+def _resolve_local_model_path(model: str) -> str:
+    """Resolve an already-downloaded model ID without network access."""
+
+    if os.path.isdir(model):
+        return os.path.abspath(model)
+    try:
+        return snapshot_download(repo_id=model, local_files_only=True)
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"ABot-World model {model!r} is not available in the local Hugging Face cache. "
+            "On an offline server, download the complete repository first and pass its local path."
+        ) from exc
+
+
+def _validate_local_model_files(model_path: str) -> None:
+    required_files = (
+        "config.json",
+        "diffusion_pytorch_model.safetensors",
+        "models_t5_umt5-xxl-enc-bf16.pth",
+        "Wan2.2_VAE.pth",
+    )
+    missing = [
+        name
+        for name in required_files
+        if not os.path.isfile(os.path.join(model_path, name))
+    ]
+    if not os.path.isdir(os.path.join(model_path, "google", "umt5-xxl")):
+        missing.append("google/umt5-xxl/")
+    if missing:
+        raise FileNotFoundError(
+            "ABot-World checkpoint is incomplete; missing: " + ", ".join(missing)
+        )
+
+
+def _convert_wan_umt5_encoder_state_dict(
+    source: dict[str, torch.Tensor], *, num_layers: int
+) -> dict[str, torch.Tensor]:
+    """Convert the original Wan T5 encoder names to Transformers UMT5."""
+
+    converted: dict[str, torch.Tensor] = {
+        "shared.weight": source["token_embedding.weight"],
+        "encoder.embed_tokens.weight": source["token_embedding.weight"],
+        "encoder.final_layer_norm.weight": source["norm.weight"],
+    }
+    consumed = {"token_embedding.weight", "norm.weight"}
+    mappings = {
+        "norm1.weight": "layer.0.layer_norm.weight",
+        "attn.q.weight": "layer.0.SelfAttention.q.weight",
+        "attn.k.weight": "layer.0.SelfAttention.k.weight",
+        "attn.v.weight": "layer.0.SelfAttention.v.weight",
+        "attn.o.weight": "layer.0.SelfAttention.o.weight",
+        "pos_embedding.embedding.weight": "layer.0.SelfAttention.relative_attention_bias.weight",
+        "norm2.weight": "layer.1.layer_norm.weight",
+        "ffn.gate.0.weight": "layer.1.DenseReluDense.wi_0.weight",
+        "ffn.fc1.weight": "layer.1.DenseReluDense.wi_1.weight",
+        "ffn.fc2.weight": "layer.1.DenseReluDense.wo.weight",
+    }
+    for index in range(num_layers):
+        source_prefix = f"blocks.{index}"
+        target_prefix = f"encoder.block.{index}"
+        for source_suffix, target_suffix in mappings.items():
+            source_name = f"{source_prefix}.{source_suffix}"
+            converted[f"{target_prefix}.{target_suffix}"] = source[source_name]
+            consumed.add(source_name)
+    unexpected = set(source) - consumed
+    if unexpected:
+        raise KeyError(
+            "Unexpected keys in Wan UMT5 encoder checkpoint: "
+            f"{sorted(unexpected)[:10]}"
+        )
+    return converted
 
 
 def _positive_finite_flow_shift(value: Any) -> float:
@@ -227,7 +300,7 @@ def get_abot_world_pre_process_func(
 def get_abot_world_post_process_func(od_config: OmniDiffusionConfig) -> Callable[..., Any]:
     del od_config
     from diffusers.video_processor import VideoProcessor
-    video_processor = VideoProcessor(vae_scale_factor=8)
+    video_processor = VideoProcessor(vae_scale_factor=16)
 
     def post_process_func(video, output_type="np", sampling_params=None):
         if isinstance(video, dict) and isinstance(video.get("payload"), dict):
@@ -267,7 +340,8 @@ class ABotWorldCausalPipeline(
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
-        local_files_only = os.path.exists(model)
+        model_path = _resolve_local_model_path(model)
+        _validate_local_model_files(model_path)
         managed_offload = bool(
             getattr(od_config, "enable_cpu_offload", False)
             or getattr(od_config, "enable_layerwise_offload", False)
@@ -275,30 +349,33 @@ class ABotWorldCausalPipeline(
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
-                model_or_path=model, subfolder="", revision=None,
-                prefix="", fall_back_to_pt=True,
+                model_or_path=model_path,
+                subfolder="",
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=True,
             )
         ]
 
         # Tokenizer from bundled google/umt5-xxl (no HF fallback)
-        tokenizer_path = os.path.join(model, "google", "umt5-xxl")
+        tokenizer_path = os.path.join(model_path, "google", "umt5-xxl")
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
 
         # Text encoder
-        self.text_encoder = self._load_text_encoder(model, dtype, local_files_only)
+        self.text_encoder = self._load_text_encoder(model_path, dtype)
         if not managed_offload:
             self.text_encoder = self.text_encoder.to(self.device)
 
         # VAE
-        self.vae = self._load_vae(model, dtype, local_files_only)
+        self.vae = self._load_vae(model_path, dtype)
         if not managed_offload:
             self.vae = self.vae.to(self.device)
 
         # Custom causal transformer
-        self.transformer = self._create_transformer(model, local_files_only)
+        self.transformer = self._create_transformer(model_path)
 
         self.vae_scale_factor_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))
-        self.vae_scale_factor_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 8))
+        self.vae_scale_factor_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 16))
         self._num_frame_per_block = 3
 
         model_config = getattr(od_config, "model_config", None) or {}
@@ -313,30 +390,34 @@ class ABotWorldCausalPipeline(
             enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
         )
 
-    def _load_text_encoder(self, model: str, dtype: torch.dtype, local_files_only: bool) -> UMT5EncoderModel:
-        from transformers import T5Config
-
-        tokenizer_path = os.path.join(model, "google", "umt5-xxl")
+    def _load_text_encoder(self, model: str, dtype: torch.dtype) -> UMT5EncoderModel:
         encoder_pth = os.path.join(model, "models_t5_umt5-xxl-enc-bf16.pth")
 
-        # UMT5-XXL encoder-only config (is_encoder_decoder=False is critical
-        # to avoid causal mask computation in the encoder).
-        config = T5Config(
+        # Match the original Wan UMT5-XXL encoder checkpoint exactly.
+        config = UMT5Config(
             d_model=4096, d_kv=64, d_ff=10240, num_layers=24,
-            num_decoder_layers=0, num_heads=64, relative_attention_num_buckets=32,
-            relative_attention_max_distance=128, dropout_rate=0.0,
+            num_decoder_layers=24, num_heads=64, relative_attention_num_buckets=32,
+            relative_attention_max_distance=128, dropout_rate=0.1,
             layer_norm_epsilon=1e-06, feed_forward_proj="gated-gelu",
-            is_encoder_decoder=False,
-            pad_token_id=0, vocab_size=256384,
+            is_encoder_decoder=True, pad_token_id=0, eos_token_id=1,
+            vocab_size=256384, tie_word_embeddings=False,
+            scalable_attention=True,
         )
 
-        text_encoder = UMT5EncoderModel(config)
-        if os.path.isfile(encoder_pth):
-            state_dict = torch.load(encoder_pth, map_location="cpu", weights_only=True)
-            text_encoder.load_state_dict(state_dict, strict=False)
-        return text_encoder
+        if not os.path.isfile(encoder_pth):
+            raise FileNotFoundError(f"UMT5 encoder checkpoint not found at {encoder_pth}")
+        source = torch.load(encoder_pth, map_location="cpu", weights_only=True)
+        if isinstance(source, dict) and isinstance(source.get("state_dict"), dict):
+            source = source["state_dict"]
+        converted = _convert_wan_umt5_encoder_state_dict(
+            source, num_layers=config.num_layers
+        )
+        with torch.device("meta"):
+            text_encoder = UMT5EncoderModel(config)
+        text_encoder.load_state_dict(converted, strict=True, assign=True)
+        return text_encoder.to(dtype=dtype)
 
-    def _load_vae(self, model: str, dtype: torch.dtype, local_files_only: bool) -> DistributedAutoencoderKLWan:
+    def _load_vae(self, model: str, dtype: torch.dtype) -> DistributedAutoencoderKLWan:
         # Load Wan2.2 VAE from bundled .pth (no HF fallback).
         vae_pth = os.path.join(model, "Wan2.2_VAE.pth")
         if os.path.isfile(vae_pth):
@@ -345,39 +426,54 @@ class ABotWorldCausalPipeline(
 
     @staticmethod
     def _load_vae_from_local_pth(vae_pth: str, dtype: torch.dtype) -> DistributedAutoencoderKLWan:
-        """Load Wan2.2 VAE from a standalone .pth checkpoint by constructing
-        a minimal compatible config inline."""
-        from diffusers.models.autoencoders import AutoencoderKLWan
+        """Convert the original Wan2.2 VAE checkpoint to Diffusers names."""
+        from diffusers.loaders.single_file_utils import convert_wan_vae_to_diffusers
 
-        # Wan2.2 VAE config (matches the checkpoint bundled with ABot-World).
         vae_config = {
             "_class_name": "AutoencoderKLWan",
-            "in_channels": 3,
-            "out_channels": 3,
-            "latent_channels": 48,
-            "down_block_types": ("WanResnetDownsampleBlock3D",) * 4,
-            "up_block_types": ("WanResnetUpsampleBlock3D",) * 4,
-            "block_out_channels": (128, 256, 512, 512),
-            "layers_per_block": 2,
-            "act_fn": "silu",
-            "scaling_factor": 0.4769,
-            "latents_mean": None,
-            "latents_std": None,
-            "norm_num_groups": 32,
-            "shift_factor": None,
-            "temporal_compression_ratio": 4,
-            "spatial_compression_ratio": 8,
-            "use_parallel_blocks": True,
-            "mid_block_add_conv": True,
+            "base_dim": 160,
+            "decoder_base_dim": 256,
+            "z_dim": 48,
+            "dim_mult": [1, 2, 4, 4],
+            "num_res_blocks": 2,
+            "attn_scales": [],
+            "temperal_downsample": [False, True, True],
+            "dropout": 0.0,
+            "in_channels": 12,
+            "out_channels": 12,
+            "patch_size": 2,
+            "scale_factor_temporal": 4,
+            "scale_factor_spatial": 16,
+            "is_residual": True,
+            "latents_mean": [
+                -0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557,
+                -0.1382, 0.0542, 0.2813, 0.0891, 0.1570, -0.0098, 0.0375, -0.1825,
+                -0.2246, -0.1207, -0.0698, 0.5109, 0.2665, -0.2108, -0.2158, 0.2502,
+                -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799, -0.1230,
+                -0.0313, -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.0520, 0.3748,
+                0.0152, 0.1957, 0.1433, -0.2944, 0.3573, -0.0548, -0.1681, -0.0667,
+            ],
+            "latents_std": [
+                0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.4990, 0.4818, 0.5013,
+                0.8158, 1.0344, 0.5894, 1.0901, 0.6885, 0.6165, 0.8454, 0.4978,
+                0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146, 0.8986, 0.5659,
+                0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093,
+                0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887,
+                0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744,
+            ],
         }
-        vae = DistributedAutoencoderKLWan.from_config(vae_config)
         state_dict = torch.load(vae_pth, map_location="cpu", weights_only=True)
-        vae.load_state_dict(state_dict, strict=False)
+        if isinstance(state_dict, dict) and isinstance(state_dict.get("state_dict"), dict):
+            state_dict = state_dict["state_dict"]
+        converted = convert_wan_vae_to_diffusers(state_dict)
+        with torch.device("meta"):
+            vae = DistributedAutoencoderKLWan.from_config(vae_config)
+        vae.load_state_dict(converted, strict=True, assign=True)
         vae = vae.to(dtype=dtype)
         vae.init_distributed()
         return vae
 
-    def _create_transformer(self, model: str, local_files_only: bool) -> ABotWorldCausalTransformer3DModel:
+    def _create_transformer(self, model: str) -> ABotWorldCausalTransformer3DModel:
         import json
         config_path = os.path.join(model, "config.json")
         if os.path.isfile(config_path):
@@ -459,6 +555,20 @@ class ABotWorldCausalPipeline(
             raise ValueError("file-path images must be materialized by pre-process.")
         if not isinstance(image, (PIL.Image.Image, torch.Tensor)):
             raise ValueError("multi_modal_data.image must be a PIL image or tensor.")
+        if isinstance(image, PIL.Image.Image):
+            source_width, source_height = image.size
+        elif image.ndim == 3 and image.shape[0] == 3:
+            source_height, source_width = image.shape[-2:]
+        elif image.ndim == 4 and image.shape[:2] == (1, 3):
+            source_height, source_width = image.shape[-2:]
+        else:
+            raise ValueError(
+                "tensor image must have shape [3, height, width] or [1, 3, height, width]."
+            )
+        if source_height <= 0 or source_width <= 0:
+            raise ValueError("source image dimensions must be positive.")
+        if source_height * source_width > _MAX_SOURCE_IMAGE_PIXELS:
+            raise ValueError("source image pixel count must not exceed 4096 * 4096.")
 
         ref_raw = multi_modal_data.get("reference_images")
         reference_images: tuple[PIL.Image.Image | torch.Tensor, ...] | None = None
@@ -469,6 +579,11 @@ class ABotWorldCausalPipeline(
                     raise ValueError("file-path reference images must be materialized by pre-process.")
                 resolved.append(r)
             reference_images = tuple(resolved)
+        if reference_images:
+            raise NotImplementedError(
+                "ABot-World reference_images conditioning is not implemented; "
+                "provide only multi_modal_data.image."
+            )
 
         extra_args = getattr(sampling, "extra_args", None) or {}
         camera_actions = extra_args.get(_PREPROCESSED_ACTION_KEY)
@@ -476,17 +591,41 @@ class ABotWorldCausalPipeline(
 
         height = getattr(sampling, "height", None) or _DEFAULT_HEIGHT
         width = getattr(sampling, "width", None) or _DEFAULT_WIDTH
+        if isinstance(height, bool) or not isinstance(height, int) or height <= 0:
+            raise ValueError(f"height must be a positive integer, got {height!r}.")
+        if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+            raise ValueError(f"width must be a positive integer, got {width!r}.")
         patch_size = tuple(self.transformer.config.patch_size)
         div = self.vae_scale_factor_spatial * patch_size[1]
         if height % div or width % div:
             raise ValueError(f"height/width must be divisible by {div}.")
 
-        num_frames = getattr(sampling, "num_frames", None) or 31
+        num_frames = getattr(sampling, "num_frames", None) or 9
+        if isinstance(num_frames, bool) or not isinstance(num_frames, int) or num_frames <= 0:
+            raise ValueError(f"num_frames must be a positive integer, got {num_frames!r}.")
+        if num_frames > _MAX_RAW_FRAMES:
+            raise ValueError(f"num_frames must not exceed {_MAX_RAW_FRAMES}.")
         if (num_frames - 1) % self.vae_scale_factor_temporal:
             raise ValueError(f"(num_frames - 1) must be divisible by {self.vae_scale_factor_temporal}.")
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         if num_latent_frames % self._num_frame_per_block:
-            raise ValueError(f"num_latent_frames ({num_latent_frames}) must be divisible by {self._num_frame_per_block}.")
+            raise ValueError(
+                f"num_latent_frames ({num_latent_frames}) must be divisible by "
+                f"{self._num_frame_per_block}."
+            )
+
+        max_sequence_length = (
+            getattr(sampling, "max_sequence_length", None) or _MAX_SEQUENCE_LENGTH
+        )
+        if max_sequence_length != _MAX_SEQUENCE_LENGTH:
+            raise ValueError(
+                f"max_sequence_length must be exactly {_MAX_SEQUENCE_LENGTH}."
+            )
+        output_type = getattr(sampling, "output_type", None) or "np"
+        if output_type not in {"latent", "np", "pt", "pil"}:
+            raise ValueError(
+                "output_type must be one of 'latent', 'np', 'pt', or 'pil'."
+            )
 
         return _ABotRequestInputs(
             prompt=prompt.strip(),
@@ -497,8 +636,8 @@ class ABotWorldCausalPipeline(
             num_frames=num_frames,
             num_latent_frames=num_latent_frames,
             num_frame_per_block=self._num_frame_per_block,
-            output_type=getattr(sampling, "output_type", None) or "np",
-            max_sequence_length=getattr(sampling, "max_sequence_length", None) or _MAX_SEQUENCE_LENGTH,
+            output_type=output_type,
+            max_sequence_length=max_sequence_length,
             flow_shift=flow_shift,
             generator=generator,
         )
@@ -507,6 +646,11 @@ class ABotWorldCausalPipeline(
 
     def _prepare_image_tensor(self, image: PIL.Image.Image | torch.Tensor, *, height: int, width: int) -> torch.Tensor:
         if isinstance(image, PIL.Image.Image):
+            image = PIL.ImageOps.fit(
+                image.convert("RGB"),
+                (width, height),
+                method=PIL.Image.Resampling.LANCZOS,
+            )
             arr = np.asarray(image, dtype=np.float32).copy()
             t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0) / 255.0
         else:
@@ -514,6 +658,8 @@ class ABotWorldCausalPipeline(
             if t.ndim == 3:
                 t = t.unsqueeze(0)
             t = t.to(dtype=torch.float32)
+            if not torch.isfinite(t).all():
+                raise ValueError("tensor image values must all be finite.")
             if t.max() > 1.0:
                 t = t / 255.0
         if t.min() >= 0.0:
@@ -532,7 +678,10 @@ class ABotWorldCausalPipeline(
         if std_val is None:
             std_val = self.vae.config.latents_std
         if mean_val is None or std_val is None:
-            return torch.as_tensor(0.0, device=ref.device, dtype=ref.dtype), torch.as_tensor(1.0, device=ref.device, dtype=ref.dtype)
+            return (
+                torch.as_tensor(0.0, device=ref.device, dtype=ref.dtype),
+                torch.as_tensor(1.0, device=ref.device, dtype=ref.dtype),
+            )
         mean = torch.as_tensor(mean_val, device=ref.device, dtype=ref.dtype).view(*shape)
         std = torch.as_tensor(std_val, device=ref.device, dtype=ref.dtype).view(*shape)
         return mean, std
@@ -581,6 +730,76 @@ class ABotWorldCausalPipeline(
 
     # ── Generation ───────────────────────────────────────────────────────
 
+    def _ar_text_caches(
+        self,
+        prompt_embeds: torch.Tensor,
+        *,
+        invalidate: bool,
+    ) -> list[ABotAttentionCache]:
+        state = self._ar_diffusion_kv_state
+        if state is None:
+            raise RuntimeError("ABot AR text cache requested without a bound state.")
+        if invalidate:
+            state.clear_cross_attention()
+        if not state.is_cross_attention_populated(self._AR_BRANCH, self._AR_TEXT_CACHE):
+            projected_text = self.transformer.text_embedding(prompt_embeds)
+
+            def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+                for block in self.transformer.blocks:
+                    cross_attention = block.cross_attn
+                    key = cross_attention.norm_k(
+                        cross_attention.k(projected_text)
+                    ).unflatten(
+                        2,
+                        (cross_attention.num_local_heads, cross_attention.head_dim),
+                    )
+                    value = cross_attention.v(projected_text).unflatten(
+                        2,
+                        (cross_attention.num_local_heads, cross_attention.head_dim),
+                    )
+                    yield key, value
+
+            state.populate_cross_attention(
+                self._AR_BRANCH, self._AR_TEXT_CACHE, layer_kv()
+            )
+        return [
+            ABotAttentionCache(
+                key=layer["k"],
+                value=layer["v"],
+                end=prompt_embeds.shape[1],
+                absolute_end=prompt_embeds.shape[1],
+                last_start=0,
+            )
+            for layer in state.get_cross_attention_kv(
+                self._AR_BRANCH, self._AR_TEXT_CACHE
+            )
+        ]
+
+    def _ar_transformer_cache(
+        self,
+        *,
+        latent: torch.Tensor,
+        cross_attention: list[ABotAttentionCache],
+        commit_current: bool,
+    ) -> ABotTransformerCache:
+        state = self._ar_diffusion_kv_state
+        if state is None:
+            raise RuntimeError("ABot AR cache requested without a bound state.")
+        patch_frames, patch_height, patch_width = self.transformer.config.patch_size
+        seq_len = (
+            (latent.shape[2] // patch_frames)
+            * (latent.shape[3] // patch_height)
+            * (latent.shape[4] // patch_width)
+        )
+        return ABotTransformerCache(
+            self_attention=state.get_kv_caches(
+                self._AR_BRANCH,
+                seq_len=seq_len,
+                commit_current=commit_current,
+            ),
+            cross_attention=cross_attention,
+        )
+
     def _generate_block(
         self,
         *,
@@ -591,7 +810,8 @@ class ABotWorldCausalPipeline(
         start_frame: int,
         schedule: tuple[tuple[float, float], ...],
         generator: torch.Generator,
-        cache: ABotTransformerCache,
+        cache: ABotTransformerCache | None,
+        ar_cross_attention: list[ABotAttentionCache] | None,
         progress_bar: TqdmProgressBar[Any],
     ) -> torch.Tensor:
         out_channels = int(self.transformer.config.out_channels)
@@ -602,17 +822,35 @@ class ABotWorldCausalPipeline(
             if not self.od_config.enforce_eager:
                 torch.compiler.cudagraph_mark_step_begin()
             set_forward_context_denoise_step_idx(step_idx)
-            timestep = torch.full((1,), float(ts_val), device=self.device, dtype=torch.float32)
+            timestep = torch.full(
+                (1, current_latents.shape[2]),
+                float(ts_val),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            if replace_first:
+                timestep[:, 0] = 0
 
             # Replace first frame with clean latent at every DMD step
             if replace_first:
                 current_latents[:, :, 0] = first_frame_latent[:, :, 0]
 
+            current_cache = (
+                self._ar_transformer_cache(
+                    latent=current_latents,
+                    cross_attention=cast(
+                        list[ABotAttentionCache], ar_cross_attention
+                    ),
+                    commit_current=False,
+                )
+                if ar_cross_attention is not None
+                else cast(ABotTransformerCache, cache)
+            )
             flow_pred = self.transformer(
                 hidden_states=current_latents.to(dtype=self.transformer.dtype),
                 timestep=timestep,
                 encoder_hidden_states=prompt_embeds,
-                cache=cache,
+                cache=current_cache,
                 start_frame=start_frame,
                 update_cache=False,
                 action_condition=action_condition,
@@ -629,16 +867,36 @@ class ABotWorldCausalPipeline(
                 current_latents = x0
             progress_bar.update()
 
+        if replace_first:
+            current_latents[:, :, 0] = first_frame_latent[:, :, 0]
+
         # Commit clean latents to KV cache (context_noise=0)
+        commit_timestep = torch.zeros(
+            (1, current_latents.shape[2]), device=self.device, dtype=torch.float32
+        )
+        commit_cache = (
+            self._ar_transformer_cache(
+                latent=current_latents,
+                cross_attention=cast(list[ABotAttentionCache], ar_cross_attention),
+                commit_current=True,
+            )
+            if ar_cross_attention is not None
+            else cast(ABotTransformerCache, cache)
+        )
         _ = self.transformer(
             hidden_states=current_latents.to(dtype=self.transformer.dtype),
-            timestep=torch.zeros(1, device=self.device, dtype=torch.float32),
+            timestep=commit_timestep,
             encoder_hidden_states=prompt_embeds,
-            cache=cache,
+            cache=commit_cache,
             start_frame=start_frame,
             update_cache=True,
             action_condition=action_condition,
         )
+        if ar_cross_attention is not None:
+            state = self._ar_diffusion_kv_state
+            if state is None:
+                raise RuntimeError("ABot AR state disappeared before KV commit.")
+            state.commit_paged_context(self._AR_BRANCH)
         return current_latents
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
@@ -648,12 +906,24 @@ class ABotWorldCausalPipeline(
             raise RuntimeError("ABot typed ticks require ARDiffusionEngine session binding.")
         if tick is None and self._ar_diffusion_kv_state is not None:
             raise ValueError("ABot ARDiffusionEngine requests must carry ar_diffusion_tick.")
+        if tick is not None and inputs.output_type != "latent":
+            raise ValueError("ABot realtime ticks require output_type='latent'.")
 
         session_state: _ABotARSessionState | None = None
         if tick is not None:
             if (inputs.height, inputs.width) != (self._ar_height, self._ar_width):
                 raise ValueError("ABot AR-Diffusion resolution must match fixed cache geometry.")
             session_state = self._ar_sessions.setdefault(tick.session_id, _ABotARSessionState())
+            if tick.chunk_index != session_state.next_chunk_index:
+                raise ValueError(
+                    "ABot realtime chunks must be contiguous: "
+                    f"got {tick.chunk_index}, expected {session_state.next_chunk_index}."
+                )
+            max_realtime_ticks = (
+                (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
+            ) // self._num_frame_per_block
+            if tick.chunk_index >= max_realtime_ticks:
+                raise ValueError("ABot realtime session exceeds the supported frame horizon.")
 
         schedule = _build_shifted_flow_schedule(flow_shift=inputs.flow_shift)
         dtype = self.transformer.dtype
@@ -666,11 +936,8 @@ class ABotWorldCausalPipeline(
 
         if tick is None:
             # ── Offline: full video generation ──
-            # Skip first-frame conditioning until VAE is properly loaded
-            first_frame_cond = None
-            action_cond = self._build_action_tensor(
-                inputs.camera_actions, inputs.num_latent_frames,
-                inputs.height, inputs.width, dtype,
+            first_frame_cond = self._encode_first_frame(
+                inputs.image, inputs.height, inputs.width, dtype
             )
             cache = self.transformer.allocate_cache(
                 batch_size=1, latent_height=latent_h, latent_width=latent_w,
@@ -682,7 +949,18 @@ class ABotWorldCausalPipeline(
             with self.progress_bar(total=total_steps) as progress_bar:
                 for local_start in range(0, inputs.num_latent_frames, block_frames):
                     stop = local_start + block_frames
-                    block_action = action_cond[:, :, local_start:stop] if action_cond is not None else None
+                    block_actions = (
+                        inputs.camera_actions[local_start:stop]
+                        if inputs.camera_actions is not None
+                        else None
+                    )
+                    block_action = self._build_action_tensor(
+                        block_actions,
+                        block_frames,
+                        inputs.height,
+                        inputs.width,
+                        dtype,
+                    )
 
                     noise = randn_tensor(
                         (1, out_channels, block_frames, latent_h, latent_w),
@@ -693,11 +971,16 @@ class ABotWorldCausalPipeline(
                         first_frame_latent=first_frame_cond, action_condition=block_action,
                         start_frame=local_start, schedule=schedule,
                         generator=inputs.generator, cache=cache,
+                        ar_cross_attention=None,
                         progress_bar=progress_bar,
                     ))
         else:
             # ── Realtime: single block ──
             assert session_state is not None
+            prompt_changed = (
+                session_state.prompt is not None
+                and session_state.prompt != inputs.prompt
+            )
             if session_state.first_frame_latent is None:
                 session_state.first_frame_latent = self._encode_first_frame(
                     inputs.image, inputs.height, inputs.width, dtype,
@@ -716,9 +999,8 @@ class ABotWorldCausalPipeline(
                 (1, out_channels, block_frames, latent_h_block, latent_w_block),
                 generator=inputs.generator, device=self.device, dtype=torch.float32,
             )
-            cache = self.transformer.allocate_cache(
-                batch_size=1, latent_height=latent_h, latent_width=latent_w,
-                device=self.device, dtype=dtype,
+            ar_cross_attention = self._ar_text_caches(
+                prompt_embeds, invalidate=prompt_changed
             )
             total_steps = len(ABOT_DMD_TIMESTEPS)
             cond_start = tick.chunk_index * block_frames
@@ -727,11 +1009,14 @@ class ABotWorldCausalPipeline(
                     noise_latent=noise, prompt_embeds=prompt_embeds,
                     first_frame_latent=ff_latent, action_condition=block_action,
                     start_frame=cond_start, schedule=schedule,
-                    generator=inputs.generator, cache=cache,
+                    generator=inputs.generator, cache=None,
+                    ar_cross_attention=ar_cross_attention,
                     progress_bar=progress_bar,
                 )]
 
         generated_latents = torch.cat(generated_blocks, dim=2)
+        if tick is None:
+            cache = None
 
         if tick is not None:
             assert session_state is not None
@@ -759,13 +1044,18 @@ class ABotWorldCausalPipeline(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Forward transformer-relevant weights to the transformer."""
-        transformer_weights: list[tuple[str, torch.Tensor]] = []
-        for name, tensor in weights:
-            if name.startswith("model."):
-                transformer_weights.append((name, tensor))
-
-        self.transformer.load_weights(transformer_weights)
-        # Transformer loaded from safetensors; VAE and text_encoder were
-        # loaded separately in __init__. Report all parameters as loaded.
-        return {name for name, _ in self.named_parameters()}
+        """Load only the root ABot generator into the custom transformer."""
+        transformer_weights = (
+            (name.removeprefix("transformer."), tensor)
+            for name, tensor in weights
+            if name.startswith("transformer.")
+        )
+        loaded = {
+            f"transformer.{name}"
+            for name in self.transformer.load_weights(transformer_weights)
+        }
+        loaded.update(f"vae.{name}" for name, _ in self.vae.named_parameters())
+        loaded.update(
+            f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()
+        )
+        return loaded

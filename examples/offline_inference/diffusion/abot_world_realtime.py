@@ -100,8 +100,8 @@ def _validate_args(args: argparse.Namespace) -> tuple[Path, Path, Path]:
         raise ValueError("--events must point to an existing JSONL file.")
     if not args.prompt.strip():
         raise ValueError("--prompt must contain non-whitespace text.")
-    if args.height <= 0 or args.width <= 0 or args.height % 16 or args.width % 16:
-        raise ValueError("--height and --width must be positive multiples of 16.")
+    if args.height <= 0 or args.width <= 0 or args.height % 32 or args.width % 32:
+        raise ValueError("--height and --width must be positive multiples of 32.")
     if args.tensor_parallel_size <= 0:
         raise ValueError("--tensor-parallel-size must be positive.")
     if not math.isfinite(args.gpu_memory_fraction) or not 0 < args.gpu_memory_fraction <= 1:
@@ -131,6 +131,7 @@ async def run(argv: Sequence[str] | None = None) -> Path:
 
     engine = AsyncOmni(
         model=args.model,
+        model_class_name="ABotWorldCausalPipeline",
         engine_backend="vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
         enforce_eager=args.enforce_eager,
         parallel_config=DiffusionParallelConfig(tensor_parallel_size=args.tensor_parallel_size),

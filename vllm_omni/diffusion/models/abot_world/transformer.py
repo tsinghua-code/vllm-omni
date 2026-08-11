@@ -26,9 +26,15 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.norm import LayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    ARDiffusionPagedLayerContext,
+    ARDiffusionPagedLayerInputs,
+    ar_diffusion_paged_attention,
+    paged_write_attn,
+)
 
 # Re-export these symbols so registry detection works correctly.
-_WAN_PACKED_MODULES = {"to_qkv": ["to_q", "to_k", "to_v"]}
+_WAN_PACKED_MODULES = {"qkv": ["q", "k", "v"]}
 
 
 # ── Inline helpers (avoid importing private symbols from wan2_2_transformer) ──
@@ -117,7 +123,7 @@ class ABotAttentionCache:
 class ABotTransformerCache:
     """One request's per-layer video K/V and reusable text K/V."""
 
-    self_attention: list[ABotAttentionCache]
+    self_attention: list[ABotAttentionCache | ARDiffusionPagedLayerContext | ARDiffusionPagedLayerInputs]
     cross_attention: list[ABotAttentionCache | None]
 
 
@@ -174,26 +180,26 @@ class ABotCausalSelfAttention(nn.Module):
         self.head_dim = head_dim
         self.inner_dim = num_heads * head_dim
 
-        self.to_qkv = QKVParallelLinear(
+        self.qkv = QKVParallelLinear(
             hidden_size=dim,
             head_size=head_dim,
             total_num_heads=num_heads,
             bias=True,
-            prefix=_projection_prefix(prefix, "to_qkv"),
+            prefix=_projection_prefix(prefix, "qkv"),
         )
-        self.num_local_heads = self.to_qkv.num_heads
+        self.num_local_heads = self.qkv.num_heads
         self.tp_inner_dim = self.num_local_heads * head_dim
 
         self.norm_q = _ABotRMSNorm(self.tp_inner_dim, eps)
         self.norm_k = _ABotRMSNorm(self.tp_inner_dim, eps)
 
-        self.to_out = RowParallelLinear(
+        self.o = RowParallelLinear(
             self.inner_dim,
             dim,
             bias=True,
             input_is_parallel=True,
             return_bias=False,
-            prefix=_projection_prefix(prefix, "to_out"),
+            prefix=_projection_prefix(prefix, "o"),
         )
         self.rotary_embedding = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
         self.attn = Attention(
@@ -203,7 +209,9 @@ class ABotCausalSelfAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             role="self",
+            qkv_layout="BSND",
             prefix=prefix,
+            skip_sequence_parallel=True,
         )
 
     def _update_cache(
@@ -227,6 +235,10 @@ class ABotCausalSelfAttention(nn.Module):
             next_key = key
             next_value = value
         elif current_start == cache.last_start:
+            if current_start + chunk_tokens != cache.absolute_end:
+                raise ValueError(
+                    "A repeated current_start must overwrite the same-size current chunk."
+                )
             if chunk_tokens > cache.end:
                 raise ValueError("The current chunk is no longer fully retained in the cache.")
             prefix_end = cache.end - chunk_tokens
@@ -236,7 +248,10 @@ class ABotCausalSelfAttention(nn.Module):
             if current_start < cache.last_start:
                 raise ValueError(f"current_start={current_start} precedes latest chunk start {cache.last_start}.")
             if current_start < cache.absolute_end:
-                raise ValueError(f"current_start={current_start} overlaps cached tokens ending at {cache.absolute_end}.")
+                raise ValueError(
+                    f"current_start={current_start} overlaps cached tokens "
+                    f"ending at {cache.absolute_end}."
+                )
             if current_start > cache.absolute_end:
                 raise ValueError(
                     f"New chunks must be contiguous: current_start={current_start}, expected {cache.absolute_end}."
@@ -282,13 +297,13 @@ class ABotCausalSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        cache: ABotAttentionCache,
+        cache: ABotAttentionCache | ARDiffusionPagedLayerInputs,
         current_start: int,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         sink_tokens: int = 0,
         update_cache: bool = True,
     ) -> torch.Tensor:
-        qkv, _ = self.to_qkv(hidden_states)
+        qkv, _ = self.qkv(hidden_states)
         q_size = self.tp_inner_dim
         kv_size = self.tp_inner_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -305,21 +320,50 @@ class ABotCausalSelfAttention(nn.Module):
             query = self.rotary_embedding(query, cos, sin)
             key = self.rotary_embedding(key, cos, sin)
 
-        visible_key, visible_value = self._update_cache(
-            cache, key, value, current_start,
-            sink_tokens=sink_tokens,
-            update_cache=update_cache,
-        )
-
-        hidden_states = self.attn(query, visible_key, visible_value)
+        if isinstance(cache, ARDiffusionPagedLayerInputs):
+            if query.shape[0] != 1:
+                raise RuntimeError("ABot AR-Diffusion paged attention requires batch_size=1.")
+            hidden_states = paged_write_attn(
+                cache, query[0], key[0], value[0], None, None, self.head_dim**-0.5
+            ).unsqueeze(0)
+        else:
+            visible_key, visible_value = self._update_cache(
+                cache, key, value, current_start,
+                sink_tokens=sink_tokens,
+                update_cache=update_cache,
+            )
+            if query.is_cuda and query.shape[0] == 1:
+                block_size = key.shape[1]
+                key_cache = visible_key[0].unflatten(0, (-1, block_size))
+                value_cache = visible_value[0].unflatten(0, (-1, block_size))
+                block_count = key_cache.shape[0]
+                hidden_states = ar_diffusion_paged_attention(
+                    query,
+                    key_cache,
+                    value_cache,
+                    block_table=torch.arange(
+                        block_count, dtype=torch.int32, device=query.device
+                    ).unsqueeze(0),
+                    query_start_loc=torch.tensor(
+                        [0, query.shape[1]], dtype=torch.int32, device=query.device
+                    ),
+                    seq_lens=torch.tensor(
+                        [visible_key.shape[1]], dtype=torch.int32, device=query.device
+                    ),
+                    max_query_len=query.shape[1],
+                    max_seq_len=visible_key.shape[1],
+                    softmax_scale=self.head_dim**-0.5,
+                )
+            else:
+                hidden_states = self.attn(query, visible_key, visible_value)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
-        return self.to_out(hidden_states)
+        return self.o(hidden_states)
 
 
 class ABotCausalCrossAttention(nn.Module):
-    """Cross-attention for ABot-World matching checkpoint parameter names (to_q, to_k, to_v, to_out)."""
+    """Cross-attention using the q/k/v/o names in the Wan checkpoint."""
 
     def __init__(
         self,
@@ -344,25 +388,25 @@ class ABotCausalCrossAttention(nn.Module):
         self.num_local_heads = num_heads // tp_size
         self.tp_inner_dim = self.num_local_heads * head_dim
 
-        self.to_q = ColumnParallelLinear(
+        self.q = ColumnParallelLinear(
             dim, dim, bias=True,
             gather_output=False, return_bias=False,
-            prefix=_projection_prefix(prefix, "to_q"),
+            prefix=_projection_prefix(prefix, "q"),
         )
-        self.to_k = ColumnParallelLinear(
+        self.k = ColumnParallelLinear(
             dim, dim, bias=True,
             gather_output=False, return_bias=False,
-            prefix=_projection_prefix(prefix, "to_k"),
+            prefix=_projection_prefix(prefix, "k"),
         )
-        self.to_v = ColumnParallelLinear(
+        self.v = ColumnParallelLinear(
             dim, dim, bias=True,
             gather_output=False, return_bias=False,
-            prefix=_projection_prefix(prefix, "to_v"),
+            prefix=_projection_prefix(prefix, "v"),
         )
-        self.to_out = RowParallelLinear(
+        self.o = RowParallelLinear(
             dim, dim, bias=True,
             input_is_parallel=True, return_bias=False,
-            prefix=_projection_prefix(prefix, "to_out"),
+            prefix=_projection_prefix(prefix, "o"),
         )
         self.norm_q = _ABotRMSNorm(self.tp_inner_dim, eps)
         self.norm_k = _ABotRMSNorm(self.tp_inner_dim, eps)
@@ -373,7 +417,9 @@ class ABotCausalCrossAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             role="cross",
+            qkv_layout="BSND",
             prefix=prefix,
+            skip_sequence_parallel=True,
             disable_kv_quant=True,
         )
 
@@ -384,14 +430,14 @@ class ABotCausalCrossAttention(nn.Module):
         *,
         cache: ABotAttentionCache | None,
     ) -> tuple[torch.Tensor, ABotAttentionCache]:
-        query = self.norm_q(self.to_q(hidden_states))
+        query = self.norm_q(self.q(hidden_states))
         query = query.unflatten(2, (self.num_local_heads, self.head_dim))
 
         if cache is None:
             if encoder_hidden_states is None:
                 raise ValueError("encoder_hidden_states required when cross-attention cache is empty.")
-            key = self.norm_k(self.to_k(encoder_hidden_states))
-            value = self.to_v(encoder_hidden_states)
+            key = self.norm_k(self.k(encoder_hidden_states))
+            value = self.v(encoder_hidden_states)
             key = key.unflatten(2, (self.num_local_heads, self.head_dim))
             value = value.unflatten(2, (self.num_local_heads, self.head_dim))
             cache = ABotAttentionCache(
@@ -405,7 +451,18 @@ class ABotCausalCrossAttention(nn.Module):
             value = cache.value[:, : cache.end]
 
         output = self.attn(query, key, value)
-        return self.to_out(output.flatten(2, 3)), cache
+        return self.o(output.flatten(2, 3)), cache
+
+
+class _ABotResidualBlock(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(dim, dim, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(dim, dim, kernel_size=3, padding=1)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states + self.conv2(self.relu(self.conv1(hidden_states)))
 
 
 class ABotSimpleAdapter(nn.Module):
@@ -427,18 +484,11 @@ class ABotSimpleAdapter(nn.Module):
         self.downscale_factor = downscale_factor
         self.control_in_dim = control_in_dim
         in_channels = control_in_dim * downscale_factor * downscale_factor
-        self.control_in_layer = nn.Conv2d(
+        self.conv = nn.Conv2d(
             in_channels, dim,
             kernel_size=2, stride=2,
         )
-        self.residual = nn.Sequential(
-            nn.GroupNorm(32, dim),
-            nn.SiLU(),
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
-            nn.GroupNorm(32, dim),
-            nn.SiLU(),
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
-        )
+        self.residual_blocks = nn.Sequential(_ABotResidualBlock(dim))
 
     def forward(
         self,
@@ -456,28 +506,23 @@ class ABotSimpleAdapter(nn.Module):
             num_frames: number of temporal frames.
             spatial_tokens: tokens per frame (H*W after patching).
         """
-        B = action_condition.shape[0]
-        # PixelUnshuffle: [B, C, F, H, W] → [B, C*16*16, F, H/16, W/16]
-        unshuffled = F.pixel_unshuffle(action_condition, self.downscale_factor)
-        _, _, F_act, H_act, W_act = unshuffled.shape
-
-        # Merge batch and frame dims for 2D conv
-        unshuffled_2d = unshuffled.permute(0, 2, 1, 3, 4).reshape(B * F_act, -1, H_act, W_act)
-        features = self.control_in_layer(unshuffled_2d)  # [B*F, dim, H', W']
-        features = self.residual(features)
+        B, _, F_act, height, width = action_condition.shape
+        frame_batch = action_condition.permute(0, 2, 1, 3, 4).reshape(
+            B * F_act, self.control_in_dim, height, width
+        )
+        unshuffled = F.pixel_unshuffle(frame_batch, self.downscale_factor)
+        features = self.residual_blocks(self.conv(unshuffled))
         # Reshape back to sequence: [B, F, dim, H', W'] → [B, F*H'*W', dim]
         _, dim, H_feat, W_feat = features.shape
         features = features.reshape(B, F_act, dim, H_feat, W_feat)
         features = features.permute(0, 1, 3, 4, 2).reshape(B, -1, dim)
 
-        # Pad/crop to match patch token count
         target_tokens = num_frames * spatial_tokens
-        if features.shape[1] < target_tokens:
-            pad = torch.zeros(B, target_tokens - features.shape[1], dim,
-                           device=features.device, dtype=features.dtype)
-            features = torch.cat((features, pad), dim=1)
-        elif features.shape[1] > target_tokens:
-            features = features[:, :target_tokens]
+        if features.shape[1] != target_tokens:
+            raise ValueError(
+                "ABot action adapter geometry does not match video patches: "
+                f"{features.shape[1]} != {target_tokens}."
+            )
 
         return patch_tokens + features
 
@@ -507,7 +552,7 @@ class ABotCausalAttentionBlock(nn.Module):
             prefix=_projection_prefix(prefix, "cross_attn"),
         )
         self.norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm3 = LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm3 = LayerNorm(dim, eps=eps, elementwise_affine=True)
         self.ffn = nn.Sequential(
             ColumnParallelLinear(
                 dim, ffn_dim, bias=True,
@@ -521,7 +566,7 @@ class ABotCausalAttentionBlock(nn.Module):
                 prefix=_projection_prefix(prefix, "ffn.2"),
             ),
         )
-        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / math.sqrt(dim))
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / math.sqrt(dim))
 
     def forward(
         self,
@@ -530,18 +575,15 @@ class ABotCausalAttentionBlock(nn.Module):
         temb: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         *,
-        self_cache: ABotAttentionCache,
+        self_cache: ABotAttentionCache | ARDiffusionPagedLayerInputs,
         cross_cache: ABotAttentionCache | None,
         current_start: int,
         sink_tokens: int = 0,
         update_cache: bool = True,
     ) -> tuple[torch.Tensor, ABotAttentionCache]:
-        # Modulations: scale_shift_table + timestep projection
-        modulation = self.scale_shift_table.unsqueeze(1) + temb.float()
-        if modulation.ndim == 4:
-            modulation = modulation.squeeze(2)
+        modulation = self.modulation.unsqueeze(1) + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            modulation.chunk(6, dim=2)
+            value.squeeze(2) for value in modulation.chunk(6, dim=2)
         )
 
         # Self-attention with per-frame modulation
@@ -575,6 +617,31 @@ class ABotCausalAttentionBlock(nn.Module):
         return hidden_states, cast(ABotAttentionCache, cross_cache)
 
 
+class ABotCausalHead(nn.Module):
+    """Wan output head with checkpoint-compatible parameter names."""
+
+    def __init__(self, dim: int, out_dim: int, eps: float) -> None:
+        super().__init__()
+        self.norm = LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.head = nn.Linear(dim, out_dim)
+        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / math.sqrt(dim))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        *,
+        tokens_per_frame: int,
+    ) -> torch.Tensor:
+        batch_size, frames, _ = temb.shape
+        hidden_states = hidden_states.unflatten(1, (frames, tokens_per_frame))
+        modulation = self.modulation.unsqueeze(1) + temb.unsqueeze(2).float()
+        shift, scale = (value.squeeze(2) for value in modulation.chunk(2, dim=2))
+        norm_hidden = self.norm(hidden_states.float()).to(hidden_states.dtype)
+        norm_hidden = norm_hidden * (1 + scale.unsqueeze(2)) + shift.unsqueeze(2)
+        return self.head(norm_hidden).reshape(batch_size, frames * tokens_per_frame, -1)
+
+
 class ABotWorldCausalTransformer3DModel(nn.Module):
     """Checkpoint-compatible causal Wan variant for ABot-World.
 
@@ -588,10 +655,9 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         model.blocks.<n>.cross_attn.norm_q/k.*
         model.blocks.<n>.ffn.0/2.*
         model.blocks.<n>.scale_shift_table
-        model.c2ws_hidden_states_layer1/layer2.*  (unused by ABot, loaded for compat)
-        model.act_control_adapter.control_in_layer.*
-        model.act_control_adapter.residual.*
-        model.head.*
+        model.act_control_adapter.conv.*
+        model.act_control_adapter.residual_blocks.0.conv1/conv2.*
+        model.head.norm.* / model.head.head.* / model.head.modulation
         model.time_embedding.*
         model.time_projection.*
         model.text_embedding.*
@@ -615,6 +681,7 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         num_layers: int = 30,
         eps: float = 1e-6,
         rope_max_seq_len: int = 1024,
+        downscale_factor_control_adapter: int = 16,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -634,6 +701,7 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
             num_layers=num_layers,
             eps=eps,
             rope_max_seq_len=rope_max_seq_len,
+            downscale_factor_control_adapter=downscale_factor_control_adapter,
         )
 
         self.patch_embedding = Conv3dLayer(
@@ -644,7 +712,9 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         )
 
         # Control adapter (action conditioning)
-        self.act_control_adapter = ABotSimpleAdapter(dim)
+        self.act_control_adapter = ABotSimpleAdapter(
+            dim, downscale_factor=downscale_factor_control_adapter
+        )
 
         # Time and text condition embeddings
         self.time_embedding = nn.Sequential(
@@ -669,9 +739,9 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         ])
 
         # Output head
-        self.norm_out = LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.head = nn.Linear(dim, out_channels * math.prod(patch_size))
-        self.head_modulation = nn.Parameter(torch.randn(1, 2, dim) / math.sqrt(dim))
+        self.head = ABotCausalHead(
+            dim, out_channels * math.prod(patch_size), eps
+        )
 
         # RoPE buffers
         temporal_dim = attention_head_dim - 4 * (attention_head_dim // 6)
@@ -698,12 +768,15 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
         head_dim = dim // num_heads
         in_channels = config.get("in_channels") or config.get("in_dim") or 48
         out_channels = config.get("out_channels") or config.get("out_dim") or 48
-        text_dim = config.get("text_dim") or config.get("text_len") or 4096
+        text_dim = config.get("text_dim") or 4096
         freq_dim = config.get("freq_dim", 256)
         ffn_dim = config.get("ffn_dim", 14336)
         num_layers = config.get("num_layers", 30)
         eps = config.get("eps", 1e-6)
         rope_max_seq_len = config.get("rope_max_seq_len", 1024)
+        downscale_factor_control_adapter = config.get(
+            "downscale_factor_control_adapter", 16
+        )
 
         return cls(
             patch_size=patch_size,
@@ -717,6 +790,7 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
             num_layers=num_layers,
             eps=eps,
             rope_max_seq_len=rope_max_seq_len,
+            downscale_factor_control_adapter=downscale_factor_control_adapter,
             prefix=prefix,
         )
 
@@ -803,6 +877,11 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
             timestep = timestep.reshape(1)
         if timestep.ndim == 1:
             timestep = timestep.unsqueeze(1).expand(batch_size, frames)
+        if timestep.shape != (batch_size, frames):
+            raise ValueError(
+                "timestep must be scalar, [batch], or [batch, frames]; "
+                f"got {tuple(timestep.shape)}, expected {(batch_size, frames)}."
+            )
         freq_embed = _sinusoidal_embedding(self.config.freq_dim, timestep.reshape(-1)).to(dtype=dtype)
         temb = self.time_embedding(freq_embed).unflatten(0, (batch_size, frames))
         timestep_proj = self.time_projection(temb).unflatten(2, (6, self.dim))
@@ -879,6 +958,7 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
             frames=patched_frames,
             dtype=hidden_states.dtype,
         )
+        timestep_proj = timestep_proj.repeat_interleave(tokens_per_frame, dim=1)
 
         # Text embedding (cached across layers after first block)
         projected_text = (
@@ -886,6 +966,28 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
             if any(c is None for c in cache.cross_attention)
             else None
         )
+
+        if cache.self_attention and isinstance(
+            cache.self_attention[0], ARDiffusionPagedLayerContext
+        ):
+            if batch_size != 1:
+                raise RuntimeError("ABot AR-Diffusion paged attention requires batch_size=1.")
+            forward_context = cache.self_attention[0].forward_ctx
+            expected_seq_len = patched_frames * tokens_per_frame
+            if forward_context.seq_len != expected_seq_len:
+                raise RuntimeError(
+                    "ABot paged context token count does not match this block: "
+                    f"{forward_context.seq_len} != {expected_seq_len}."
+                )
+            forward_context.prepare(
+                device=hidden_states.device,
+                action_len=0,
+                query_len=hidden_states.shape[1],
+            )
+            cache.self_attention = [
+                layer_context.to_layer_inputs()
+                for layer_context in cache.self_attention
+            ]
 
         for idx, block in enumerate(self.blocks):
             hidden_states, cross_cache = block(
@@ -901,15 +1003,9 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
             )
             cache.cross_attention[idx] = cross_cache
 
-        # Output head with modulation
-        modulation = self.head_modulation.unsqueeze(1) + temb.unsqueeze(2).float()
-        shift, scale = modulation.chunk(2, dim=2)
-        shift = shift.squeeze(2) if shift.ndim == 4 else shift
-        scale = scale.squeeze(2) if scale.ndim == 4 else scale
-
-        norm_hidden = self.norm_out(hidden_states.float()).to(hidden_states.dtype)
-        norm_hidden = norm_hidden * (1 + scale) + shift
-        hidden_states = self.head(norm_hidden)
+        hidden_states = self.head(
+            hidden_states, temb, tokens_per_frame=tokens_per_frame
+        )
 
         return self._unpatchify(
             hidden_states,
@@ -922,20 +1018,28 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
         loaded: set[str] = set()
-        qkv_fusion = (("to_q", "q"), ("to_k", "k"), ("to_v", "v"))
+        qkv_fusion = (("q", "q"), ("k", "k"), ("v", "v"))
 
         for checkpoint_name, loaded_weight in weights:
             name = checkpoint_name
-            # The checkpoint uses a "model." prefix for all parameters.
-            if name.startswith("model."):
-                name = name[len("model."):]
+            for source_prefix in (
+                "generator.model._fsdp_wrapped_module.",
+                "generator.model.",
+                "model._fsdp_wrapped_module.",
+                "model.",
+                "_fsdp_wrapped_module.",
+                "module.",
+            ):
+                if name.startswith(source_prefix):
+                    name = name[len(source_prefix):]
+                    break
 
             # Fuse self-attention Q/K/V → to_qkv
             shard_id = None
             for proj_name, proj_shard in qkv_fusion:
                 marker = f".self_attn.{proj_name}."
                 if marker in name:
-                    name = name.replace(marker, ".self_attn.to_qkv.")
+                    name = name.replace(marker, ".self_attn.qkv.")
                     shard_id = proj_shard
                     break
 
@@ -948,8 +1052,7 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
                     name = stripped
 
             if name not in params:
-                # Skip unused Wan I2V camera / legacy weights gracefully.
-                continue
+                raise KeyError(f"Unexpected ABot model weight name: {checkpoint_name}")
 
             param = params[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
