@@ -240,7 +240,9 @@ def _fix_wan22_residual_vae_keys(
     converted = {
         key: value
         for key, value in converted.items()
-        if not key.startswith(("encoder.down_blocks.", "decoder.up_blocks."))
+        if not key.startswith(
+            ("encoder.down_blocks.", "decoder.up_blocks.", "decoder.upsamples.")
+        )
     }
     tail_replacements = {
         "residual.0.": "norm1.",

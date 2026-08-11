@@ -137,12 +137,14 @@ def test_wan22_residual_vae_conversion_preserves_grouped_blocks() -> None:
         "encoder.downsamples.0.downsamples.2.resample.1.weight": torch.tensor(1),
         "decoder.upsamples.0.upsamples.2.shortcut.weight": torch.tensor(2),
         "decoder.upsamples.0.upsamples.3.time_conv.weight": torch.tensor(3),
+        "decoder.upsamples.3.upsamples.0.residual.0.gamma": torch.tensor(4),
     }
     converted = _fix_wan22_residual_vae_keys(
         source,
         {
             "encoder.down_blocks.0.downsamples.0.norm1.gamma": torch.tensor(-1),
             "decoder.up_blocks.0.resnets.0.norm1.gamma": torch.tensor(-1),
+            "decoder.upsamples.3.upsamples.0.residual.0.gamma": torch.tensor(-1),
             "quant_conv.weight": torch.tensor(4),
         },
     )
@@ -152,6 +154,7 @@ def test_wan22_residual_vae_conversion_preserves_grouped_blocks() -> None:
         "encoder.down_blocks.0.downsampler.resample.1.weight",
         "decoder.up_blocks.0.resnets.2.conv_shortcut.weight",
         "decoder.up_blocks.0.upsampler.time_conv.weight",
+        "decoder.up_blocks.3.resnets.0.norm1.gamma",
         "quant_conv.weight",
     }
 
