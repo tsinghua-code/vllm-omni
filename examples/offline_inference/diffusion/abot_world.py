@@ -54,7 +54,7 @@ def _validate_args(args: argparse.Namespace) -> tuple[Path, Path]:
     return image, output
 
 
-def run(argv: Sequence[str] | None = None) -> Path:
+async def run(argv: Sequence[str] | None = None) -> Path:
     args = parse_args(argv)
     image, output_path = _validate_args(args)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,7 +84,7 @@ def run(argv: Sequence[str] | None = None) -> Path:
     }
 
     outputs = engine.generate(prompt, sampling_params_list=[sampling])
-    for output in outputs:
+    async for output in outputs:
         if output.finished and output.stage_id == 0:
             if output.error:
                 raise RuntimeError(f"Generation failed: {output.error}")
@@ -105,7 +105,6 @@ def run(argv: Sequence[str] | None = None) -> Path:
                     print(f"Video saved to {output_path}")
                     break
                 elif isinstance(video, (list, tuple)):
-                    # Already post-processed
                     import numpy as np
                     import imageio
                     frames_uint8 = []
@@ -128,7 +127,8 @@ def run(argv: Sequence[str] | None = None) -> Path:
 
 
 def main(argv: Sequence[str] | None = None) -> Path:
-    return run(argv)
+    import asyncio
+    return asyncio.run(run(argv))
 
 
 if __name__ == "__main__":
