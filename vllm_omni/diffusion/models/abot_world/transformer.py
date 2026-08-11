@@ -581,7 +581,9 @@ class ABotCausalAttentionBlock(nn.Module):
         sink_tokens: int = 0,
         update_cache: bool = True,
     ) -> tuple[torch.Tensor, ABotAttentionCache]:
-        modulation = self.modulation.unsqueeze(1) + temb.float()
+        modulation = (self.modulation.unsqueeze(1) + temb.float()).to(
+            hidden_states.dtype
+        )
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
             value.squeeze(2) for value in modulation.chunk(6, dim=2)
         )
@@ -635,7 +637,9 @@ class ABotCausalHead(nn.Module):
     ) -> torch.Tensor:
         batch_size, frames, _ = temb.shape
         hidden_states = hidden_states.unflatten(1, (frames, tokens_per_frame))
-        modulation = self.modulation.unsqueeze(1) + temb.unsqueeze(2).float()
+        modulation = (
+            self.modulation.unsqueeze(1) + temb.unsqueeze(2).float()
+        ).to(hidden_states.dtype)
         shift, scale = (value.squeeze(2) for value in modulation.chunk(2, dim=2))
         norm_hidden = self.norm(hidden_states.float()).to(hidden_states.dtype)
         norm_hidden = norm_hidden * (1 + scale.unsqueeze(2)) + shift.unsqueeze(2)

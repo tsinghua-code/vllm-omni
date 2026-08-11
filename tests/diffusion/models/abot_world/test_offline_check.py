@@ -23,6 +23,7 @@ from vllm_omni.diffusion.models.abot_world.pipeline import (
     _validate_local_model_files,
 )
 from vllm_omni.diffusion.models.abot_world.transformer import (
+    ABotCausalHead,
     ABotWorldCausalTransformer3DModel,
 )
 
@@ -139,6 +140,18 @@ def test_wan22_residual_vae_conversion_preserves_grouped_blocks() -> None:
         "decoder.upsamples.0.upsamples.3.time_conv.weight": torch.tensor(3),
         "decoder.upsamples.3.upsamples.0.residual.0.gamma": torch.tensor(4),
     }
+
+
+def test_abot_head_keeps_bfloat16_through_modulation() -> None:
+    head = ABotCausalHead(dim=4, out_dim=2, eps=1e-6).to(torch.bfloat16)
+
+    output = head(
+        torch.zeros(1, 2, 4, dtype=torch.bfloat16),
+        torch.zeros(1, 1, 4, dtype=torch.bfloat16),
+        tokens_per_frame=2,
+    )
+
+    assert output.dtype == torch.bfloat16
     converted = _fix_wan22_residual_vae_keys(
         source,
         {
