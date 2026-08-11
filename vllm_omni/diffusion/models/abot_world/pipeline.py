@@ -538,11 +538,10 @@ class ABotWorldCausalPipeline(
         return mean, std
 
     def _encode_first_frame(self, image: PIL.Image.Image | torch.Tensor, height: int, width: int,
-                            num_latent_frames: int, dtype: torch.dtype) -> torch.Tensor:
-        """VAE-encode first frame into 48-channel latent, tiled across all latent frames."""
+                            dtype: torch.dtype) -> torch.Tensor:
+        """VAE-encode the first frame image into a single 48-channel latent frame."""
         img = self._prepare_image_tensor(image, height=height, width=width)
-        video = img.new_zeros(1, 3, num_latent_frames, height, width)
-        video[:, :, 0] = img
+        video = img.unsqueeze(2)  # [1, 3, 1, H, W]
         latent = retrieve_latents(self.vae.encode(video.to(dtype=self.vae.dtype)), sample_mode="argmax")
         mean, std = self._vae_latent_stats(latent)
         return ((latent - mean) / std).to(dtype=dtype)
@@ -587,7 +586,7 @@ class ABotWorldCausalPipeline(
         *,
         noise_latent: torch.Tensor,
         prompt_embeds: torch.Tensor,
-        first_frame_latent: torch.Tensor,
+        first_frame_latent: torch.Tensor | None,
         action_condition: torch.Tensor | None,
         start_frame: int,
         schedule: tuple[tuple[float, float], ...],
@@ -597,6 +596,7 @@ class ABotWorldCausalPipeline(
     ) -> torch.Tensor:
         out_channels = int(self.transformer.config.out_channels)
         current_latents = noise_latent
+        replace_first = start_frame == 0 and first_frame_latent is not None
 
         for step_idx, (ts_val, sigma) in enumerate(schedule):
             if not self.od_config.enforce_eager:
@@ -604,8 +604,9 @@ class ABotWorldCausalPipeline(
             set_forward_context_denoise_step_idx(step_idx)
             timestep = torch.full((1,), float(ts_val), device=self.device, dtype=torch.float32)
 
-            # Replace first frame with clean latent at every step
-            current_latents[:, :, 0] = first_frame_latent[:, :, 0]
+            # Replace first frame with clean latent at every DMD step
+            if replace_first:
+                current_latents[:, :, 0] = first_frame_latent[:, :, 0]
 
             flow_pred = self.transformer(
                 hidden_states=current_latents.to(dtype=self.transformer.dtype),
@@ -665,9 +666,8 @@ class ABotWorldCausalPipeline(
 
         if tick is None:
             # ── Offline: full video generation ──
-            first_frame_latent = self._encode_first_frame(
-                inputs.image, inputs.height, inputs.width,
-                inputs.num_latent_frames, dtype,
+            ff_latent = self._encode_first_frame(
+                inputs.image, inputs.height, inputs.width, dtype,
             )
             action_cond = self._build_action_tensor(
                 inputs.camera_actions, inputs.num_latent_frames,
@@ -685,10 +685,12 @@ class ABotWorldCausalPipeline(
                     stop = local_start + block_frames
                     # Slice action condition for this block
                     block_action = action_cond[:, :, local_start:stop] if action_cond is not None else None
-                    block_ff = first_frame_latent[:, :, local_start:stop]
+                    # First frame only applies to the very first block
+                    block_ff = ff_latent if local_start == 0 else None
 
+                    _, _, _, latent_h_block, latent_w_block = ff_latent.shape
                     noise = randn_tensor(
-                        (1, out_channels, block_frames, block_ff.shape[-2], block_ff.shape[-1]),
+                        (1, out_channels, block_frames, latent_h_block, latent_w_block),
                         generator=inputs.generator, device=self.device, dtype=torch.float32,
                     )
                     generated_blocks.append(self._generate_block(
@@ -703,12 +705,12 @@ class ABotWorldCausalPipeline(
             assert session_state is not None
             if session_state.first_frame_latent is None:
                 session_state.first_frame_latent = self._encode_first_frame(
-                    inputs.image, inputs.height, inputs.width,
-                    (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1, dtype,
+                    inputs.image, inputs.height, inputs.width, dtype,
                 )
-            cond_start = tick.chunk_index * block_frames
-            cond_stop = cond_start + block_frames
-            block_ff = session_state.first_frame_latent[:, :, cond_start:cond_stop]
+            # First frame only applies to the very first chunk
+            ff_latent = session_state.first_frame_latent if tick.chunk_index == 0 else None
+
+            _, _, _, latent_h_block, latent_w_block = session_state.first_frame_latent.shape
             block_action = self._build_action_tensor(
                 inputs.camera_actions, block_frames, inputs.height, inputs.width, dtype,
             )
@@ -716,7 +718,7 @@ class ABotWorldCausalPipeline(
                 inputs.generator.set_state(session_state.generator_state)
 
             noise = randn_tensor(
-                (1, out_channels, block_frames, block_ff.shape[-2], block_ff.shape[-1]),
+                (1, out_channels, block_frames, latent_h_block, latent_w_block),
                 generator=inputs.generator, device=self.device, dtype=torch.float32,
             )
             cache = self.transformer.allocate_cache(
@@ -724,10 +726,11 @@ class ABotWorldCausalPipeline(
                 device=self.device, dtype=dtype,
             )
             total_steps = len(ABOT_DMD_TIMESTEPS)
+            cond_start = tick.chunk_index * block_frames
             with self.progress_bar(total=total_steps) as progress_bar:
                 generated_blocks = [self._generate_block(
                     noise_latent=noise, prompt_embeds=prompt_embeds,
-                    first_frame_latent=block_ff, action_condition=block_action,
+                    first_frame_latent=ff_latent, action_condition=block_action,
                     start_frame=cond_start, schedule=schedule,
                     generator=inputs.generator, cache=cache,
                     progress_bar=progress_bar,
