@@ -666,9 +666,8 @@ class ABotWorldCausalPipeline(
 
         if tick is None:
             # ── Offline: full video generation ──
-            ff_latent = self._encode_first_frame(
-                inputs.image, inputs.height, inputs.width, dtype,
-            )
+            # Skip first-frame conditioning until VAE is properly loaded
+            first_frame_cond = None
             action_cond = self._build_action_tensor(
                 inputs.camera_actions, inputs.num_latent_frames,
                 inputs.height, inputs.width, dtype,
@@ -683,19 +682,15 @@ class ABotWorldCausalPipeline(
             with self.progress_bar(total=total_steps) as progress_bar:
                 for local_start in range(0, inputs.num_latent_frames, block_frames):
                     stop = local_start + block_frames
-                    # Slice action condition for this block
                     block_action = action_cond[:, :, local_start:stop] if action_cond is not None else None
-                    # First frame only applies to the very first block
-                    block_ff = ff_latent if local_start == 0 else None
 
-                    _, _, _, latent_h_block, latent_w_block = ff_latent.shape
                     noise = randn_tensor(
-                        (1, out_channels, block_frames, latent_h_block, latent_w_block),
+                        (1, out_channels, block_frames, latent_h, latent_w),
                         generator=inputs.generator, device=self.device, dtype=torch.float32,
                     )
                     generated_blocks.append(self._generate_block(
                         noise_latent=noise, prompt_embeds=prompt_embeds,
-                        first_frame_latent=block_ff, action_condition=block_action,
+                        first_frame_latent=first_frame_cond, action_condition=block_action,
                         start_frame=local_start, schedule=schedule,
                         generator=inputs.generator, cache=cache,
                         progress_bar=progress_bar,
