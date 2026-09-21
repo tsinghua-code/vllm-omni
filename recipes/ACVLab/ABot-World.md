@@ -134,12 +134,12 @@ pool storage addresses and sizes must remain unchanged. Allocating pages from
 that fixed pool is not a bucket-growth event; a normal clean-KV forward is not
 a CUDA Graph capture. No stall is attributed to either without such evidence.
 
-### Measured validation (2026-09-19)
+### Measured validation (2026-09-21)
 
-One scheduler-reserved **NVIDIA L20X 140GB**, TP=1, BF16 eager, 512x832,
+One scheduler-reserved **NVIDIA H200**, TP=1, BF16 eager, 512x832,
 seed 42, four DMD steps plus one clean-KV forward per tick. Environment:
-Python 3.12, PyTorch 2.13.0 / CUDA 13, vLLM 0.27.1, Diffusers 0.38.0,
-Transformers 5.14.1. These are not A100 or H200 measurements. Both streaming
+Python 3.12, PyTorch 2.13.0 / CUDA 13, vLLM 0.29.0, Diffusers 0.38.0,
+Transformers 5.14.1. Both streaming
 modes completed 35 ticks / 417 frames per rollout with finite RGB output.
 
 Each value below is the median across three measured runs, excluding the
@@ -148,10 +148,10 @@ figure is CPU-ready chunk latency, not a network-delivered single-frame TTFT.
 
 | Decoder / API | First chunk (ms) | Steady median (ms/tick) | Steady p95 (ms/tick) | Sum of 35 tick intervals (s) |
 | --- | ---: | ---: | ---: | ---: |
-| Full Wan / typed | 578.6 | 590.3 | 605.5 | 20.712 |
-| Full Wan / stepwise | 595.9 | 587.8 | 611.3 | 20.765 |
-| TAEW2.2 / typed | 1407.2 | 304.7 | 330.4 | 11.618 |
-| TAEW2.2 / stepwise | 1001.8 | 299.5 | 323.1 | 11.212 |
+| Full Wan / typed | 570.1 | 614.6 | 661.3 | 21.617 |
+| Full Wan / stepwise | 606.3 | 611.9 | 628.1 | 21.460 |
+| TAEW2.2 / typed | 858.3 | 295.7 | 316.0 | 11.073 |
+| TAEW2.2 / stepwise | 870.7 | 295.3 | 323.3 | 11.161 |
 
 The tiny path still uses the full Wan encoder for the input image, moving it
 onto the GPU for encoding and back to CPU afterward. It improves steady decode
@@ -170,7 +170,7 @@ Both backends retained two live decoding sessions. All six interleaved chunks
 (A0/B0/A1/B1/A2/B2, with different camera controls) were bit-identical to their
 corresponding solo controls. Each cache stayed bounded, closing A preserved B,
 and closing both left no decoder state. Full-Wan peak PyTorch allocated memory
-was 46.078 GiB; tiny peak was 40.150 GiB with this configuration. These include
+was 46.078 GiB; tiny peak was 41.775 GiB with this configuration. These include
 the configured fixed KV pool (`gpu_memory_fraction=0.15`) and are not minimum
 GPU-memory requirements or total driver memory usage.
 
@@ -183,15 +183,9 @@ mean per-chunk float PSNR **30.13 dB** and RGB8 SSIM **0.7988**. This is a
 single-scene consistency check, not a general image-quality certification.
 
 All KV pool storage identities and sizes remained fixed at the snapshots;
-CUDA Graph was disabled. One full-Wan stepwise run had an **855.6 ms** interval
-at zero-based tick **22**; it is retained in the data, not labeled as a capture
-or bucket-growth stall without supporting evidence.
-
-Raw warmup and measured intervals: [per-tick CSV](ABot-World-evidence/per-tick.csv).
-Quality by chunk: [quality CSV](ABot-World-evidence/quality.csv).
-Aggregated latency and residency: [summary JSON](ABot-World-evidence/summary.json).
-
-![ABot streaming validation](ABot-World-evidence/abot-review-validation.png)
+CUDA Graph was disabled. The largest measured non-warmup full-Wan interval was
+**802.1 ms** at zero-based typed tick **33**; it is retained in the data, not
+labeled as a capture or bucket-growth stall without supporting evidence.
 
 CPU regression checks (matching vLLM installation and pytest dependencies;
 no checkpoint or GPU allocation needed):
@@ -204,8 +198,8 @@ pytest -o addopts= tests/diffusion/models/abot_world tests/diffusion/ar_diffusio
   -m 'core_model and cpu' --run-level=core_model -q
 ```
 
-The focused original-directory run passed 79 tests. The submission-only source
-snapshot passed 197 tests with 8 skipped. The new CPU cases are already covered
+The focused run passed 79 tests. The broader diffusion CPU sweep passed 224
+tests with 14 skipped and 1 deselected. The new CPU cases are already covered
 by the existing Buildkite `tests/diffusion -m 'core_model and cpu'` sweep.
 
 ## Current limitations
