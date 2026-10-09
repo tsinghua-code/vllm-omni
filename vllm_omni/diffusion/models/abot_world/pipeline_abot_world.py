@@ -30,6 +30,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import retrieve_latents
+from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -486,9 +487,7 @@ class ABotWorldCausalPipeline(
         model_config = getattr(od_config, "model_config", None) or {}
         self._vae_backend = model_config.get("abot_vae", "wan")
         _validate_local_model_files(model_path, vae_backend=self._vae_backend)
-        managed_offload = bool(
-            getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
-        )
+        managed_offload = offload_enabled(od_config)
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
