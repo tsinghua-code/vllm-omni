@@ -48,14 +48,27 @@ directory. Both retain the original Wan image encoder and the same normalized
 approximation, not a quality-equivalent replacement or a quantized Wan VAE.
 
 ```bash
-python examples/offline_inference/diffusion/abot_world_realtime.py \
-  --model /path/to/ABot-World-0-5B-LF --image /path/to/image.jpg \
-  --vae wan --ticks 35 --output abot-35ticks.mp4
+python -c 'import json; from pathlib import Path; Path("actions.json").write_text(json.dumps([[[],[],[]]] * 35))'
+python examples/offline_inference/diffusion/ar_diffusion_streaming_decode.py \
+  --model /path/to/ABot-World-0-5B-LF \
+  --model-class-name ABotWorldCausalPipeline --image /path/to/image.jpg \
+  --prompt "The camera moves slowly forward through the scene." \
+  --action-script actions.json --height 512 --width 832 \
+  --frames-per-block 3 --temporal-compression 4 --enforce-eager \
+  --model-config '{"abot_vae":"wan"}' --output-dir /path/to/abot-35ticks
 ```
 
 This uses `step_execution=True`, `diffusion_streaming_output=True`, and one
 `generate()` call for the complete rollout. It prepares the first image and
-prompt once. Optional `--actions actions.json` supplies one three-frame action
+prompt once. The shared task runner saves decoded chunks as lossless RGB8
+NumPy arrays and records their frame counts and timing in `summary.json`.
+ABot checkpoint loading, default geometry, action-key adaptation, and decoder
+selection remain in `vllm_omni/diffusion/models/abot_world/`; the runner contains
+no ABot-specific imports or shape assertions. Native checkpoints declare their
+block geometry through the two generic flags; Diffusers checkpoints continue
+to read it from their transformer/VAE configs. Select the tiny decoder with
+`--model-config '{"abot_vae":"taew2_2"}'`.
+`--action-script actions.json` supplies one three-frame action
 list per tick, for example `[[["w"],[],[]],[[],["j"],[]]]` for two ticks.
 Actions must all be known at request start; this is not a mid-rollout control
 transport. Typed sessions below accept incremental events instead.
@@ -134,7 +147,61 @@ pool storage addresses and sizes must remain unchanged. Allocating pages from
 that fixed pool is not a bucket-growth event; a normal clean-KV forward is not
 a CUDA Graph capture. No stall is attributed to either without such evidence.
 
-### Measured validation (2026-09-21)
+### Shared-runner validation (2026-10-11)
+
+The shared-runner change was tested on the candidate based on
+`39f01957bfb75a30ebc44cf92c6314c4a0d887ed`, with the source patch and hashes
+retained separately from the historical measurements below. The final commit
+and matching source hash are recorded in the PR's test results. Environment:
+Python 3.12, PyTorch 2.13.0 / CUDA 13, vLLM 0.31.0, Diffusers 0.40.0,
+Transformers 5.14.1; one scheduler-reserved GPU reported by the driver as
+**NVIDIA L20X (140 GiB)**, driver 570.133.20, TP=1, BF16 eager.
+
+Both `wan` and `taew2_2` passed one-request, three-tick GPU smoke checks:
+finite RGB output at 512x832 with 9/12/12 frames, 33 frames total. The action
+script used W, J, then D for each tick's three latent frames; seed 42 and the
+prompt above were fixed. These cold smoke runs include startup and output IO;
+they are not latency baselines or new 35-tick performance measurements.
+The focused CPU regressions passed 103 tests, including generic checkpoint
+geometry, pipeline overrides, error propagation, and incomplete-rollout checks.
+The example tests are covered by the existing Buildkite CPU-simple sweep of
+`tests/` outside the separately routed diffusion/engine/model-executor suites.
+
+The canonical comparison attempted the unmodified official implementation at
+[`5c3f7260f2346ebb60a49efb81a7db5bfe15d7e5`](https://github.com/amap-cvlab/ABot-World/tree/5c3f7260f2346ebb60a49efb81a7db5bfe15d7e5),
+using checkpoint revision `6e1e819fbba9aa462d21b89837706efc0e6223a3` and full
+Wan decoding. The DiT weights' SHA256 is
+`fab41e21ee927eeebfd4d9d5b7120d0660f39d22c54fae45178b1db2e0fba127`.
+Both paths used the same resized 512x832 official example image, prompt,
+W/J/D controls and seed; even with matched inputs, canonical BF16/global RNG
+and Omni FP32/session RNG are not bitwise aligned.
+
+**Concrete blocker:** the installed `flash_attn` namespace does not expose
+`flash_attn_varlen_func`. The official run fails before its first output chunk
+with `AttributeError` in `wan/modules/attention.py:255`. Selecting the official
+SDPA default does not unblock it: `wan/modules/causal_model.py:1196` explicitly
+requests `backend='flash_attn'` for cross-attention. No official model or
+attention code was patched, and no shared environment packages were replaced.
+The import-level prerequisite can be checked in the canonical environment:
+
+```bash
+python -c 'import flash_attn; assert callable(getattr(flash_attn, "flash_attn_varlen_func", None)), "canonical FlashAttention API unavailable"'
+```
+
+Logs, frozen checkpoint/input hashes, the canonical driver and Omni RGB chunks
+were retained outside the repository. There are no paired canonical outputs
+or canonical PSNR/SSIM results yet. Qualification remains **Omni serving
+consistency and integration smoke only**, not canonical quality equivalence,
+weight-conversion/DMD/action-adapter equivalence, or official performance parity.
+Rerun the paired comparison once a compatible canonical FlashAttention build
+is available; matching a seed alone is not an exact-output oracle.
+
+### Historical measured validation (2026-09-21)
+
+These measurements predate the current-head integration. They are historical
+serving-consistency evidence, not a rerun on the final PR head or a comparison
+against the canonical ABot implementation. Do not use them to qualify native
+weight conversion, DMD scheduling, or action-adapter equivalence to upstream.
 
 One scheduler-reserved **NVIDIA H200**, TP=1, BF16 eager, 512x832,
 seed 42, four DMD steps plus one clean-KV forward per tick. Environment:
