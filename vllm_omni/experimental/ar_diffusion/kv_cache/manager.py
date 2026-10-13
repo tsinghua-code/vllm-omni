@@ -319,6 +319,8 @@ class ARDiffusionKVCache:
             for name, length in self.cross_attention_lengths.items()
         )
 
+        resident_frames = config.sink_chunks + config.window_chunks
+
         def _required_managed_blocks(capacity: int) -> int:
             """Managed blocks needed to hold ``capacity`` resident sessions.
 
@@ -332,7 +334,6 @@ class ARDiffusionKVCache:
             the requirement -- it only stops the final block of each term from
             rounding up a whole frame's worth of memory.
             """
-            resident_frames = config.sink_chunks + config.window_chunks
             per_session_blocks = resident_frames * self.blocks_per_frame
             in_flight_blocks = self.frames_per_block * self.blocks_per_frame
             headroom_blocks = 2 * self.blocks_per_frame
