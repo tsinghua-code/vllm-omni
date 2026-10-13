@@ -32,6 +32,15 @@ class MaskMode(str, Enum):
     UNKNOWN = "unknown"
 
 
+class AttentionComputation(str, Enum):
+    SELF = "self"
+    CROSS = "cross"
+
+
+class CrossAttentionParallelLayout(str, Enum):
+    LOCAL_Q_REPLICATED_KV = "local_q_replicated_kv"
+
+
 class ParallelStrategy(str, Enum):
     NONE = "none"
     ULYSSES = "ulysses"
@@ -80,6 +89,7 @@ class ExecutionContext:
     parallel_strategy: ParallelStrategy = ParallelStrategy.NONE
     require_fullgraph: bool = False
     outer_boundaries: frozenset[OuterBoundary] = frozenset()
+    computation: AttentionComputation = AttentionComputation.SELF
 
 
 @dataclass(frozen=True, slots=True)

@@ -21,6 +21,8 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.capabilities import (
+    AttentionComputation,
+    CrossAttentionParallelLayout,
     ExecutionContext,
     ExecutionPathResult,
     OuterBoundary,
@@ -95,12 +97,39 @@ class Attention(nn.Module):
         # Keep the platform-selected backend and its capabilities unchanged.
         # Each override must preserve the selected implementation's contract.
         impl_overrides: Mapping[str, type[AttentionImpl]] | None = None,
+        # Computation semantics are independent of the role used for config.
+        # Omitted for legacy callers; new cross-attention callers set it.
+        computation: AttentionComputation | str | None = None,
+        cross_parallel_layout: CrossAttentionParallelLayout | str | None = None,
+        cross_mask_kind: str | None = None,
     ):
         super().__init__()
 
         self.role = role
         self.role_category = role_category
         self.qkv_layout = qkv_layout
+        default_computation = "cross" if role == "cross" else "self"
+        self.computation = AttentionComputation(computation if computation is not None else default_computation)
+        self._explicit_cross_contract = computation is not None and self.computation is AttentionComputation.CROSS
+        self.cross_parallel_layout = (
+            CrossAttentionParallelLayout(cross_parallel_layout) if cross_parallel_layout is not None else None
+        )
+        self.cross_mask_kind = cross_mask_kind
+        if self._explicit_cross_contract:
+            if causal:
+                raise NotImplementedError("The first cross-attention contract supports noncausal execution only")
+            if qkv_layout != "BSND":
+                raise ValueError("The first cross-attention contract requires qkv_layout='BSND'")
+            if self.cross_parallel_layout is not CrossAttentionParallelLayout.LOCAL_Q_REPLICATED_KV:
+                raise ValueError(
+                    "The first cross-attention contract requires local Q and replicated K/V on each SP rank"
+                )
+            if not skip_sequence_parallel:
+                raise ValueError("Local-Q/replicated-KV cross attention requires skip_sequence_parallel=True")
+            if paged_kv_cache_role is not None:
+                raise ValueError("Conditioning cross attention does not use Scheduler-managed paged KV")
+            if cross_mask_kind not in (None, "kv"):
+                raise ValueError("The first cross-attention contract supports only a KV validity mask")
         # ``prefix`` is also the stable layer identity used by vLLM's native
         # KV-cache metadata.  Keep it on the Omni layer so the active paged
         # adapter can dispatch the already-resharded Q/K/V to the matching
@@ -219,6 +248,7 @@ class Attention(nn.Module):
                 prefix=prefix,
                 backend_kwargs=backend_kwargs,
                 role=role,
+                computation=self.computation,
                 backend_explicit=self.backend_explicit,
             )
             # Compatibility kernels run inside shared dispatch, between the
@@ -434,6 +464,7 @@ class Attention(nn.Module):
             outer_boundaries=frozenset(boundaries),
             paged_kv=self.is_paged_kv_active(),
             parallel_strategy=parallel_strategy,
+            computation=getattr(self, "computation", AttentionComputation.SELF),
         )
         resolver = getattr(self.attention, "resolve_execution_path", None)
         if not callable(resolver):
@@ -468,6 +499,8 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if getattr(self, "_explicit_cross_contract", False):
+            self._validate_cross_inputs(query, key, value, attn_metadata)
         # Get the appropriate parallel strategy based on SP active state
         strategy = self._get_active_parallel_strategy()
         paged_adapter = self._active_paged_kv_adapter()
@@ -568,6 +601,64 @@ class Attention(nn.Module):
         out = strategy.post_attention(out, ctx)
 
         return out
+
+    def _validate_cross_inputs(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> None:
+        if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+            raise ValueError("Cross attention requires BSND Q/K/V tensors")
+        q_shape, k_shape, v_shape = query.shape, key.shape, value.shape
+        if q_shape[0] != k_shape[0] or k_shape[0] != v_shape[0]:
+            raise ValueError("Cross attention requires matching Q/K/V batch sizes")
+        if q_shape[1] <= 0 or k_shape[1] <= 0 or k_shape[1] != v_shape[1]:
+            raise ValueError("Cross attention requires nonempty Q/K/V and matching K/V sequence lengths")
+        if q_shape[2] != self.num_heads or k_shape[2] != self.num_kv_heads or v_shape[2] != self.num_kv_heads:
+            raise ValueError("Cross attention Q/K/V head counts do not match the declared local head geometry")
+        if self.num_heads != self.num_kv_heads:
+            raise NotImplementedError("The first cross-attention contract does not support general GQA")
+        if q_shape[3] != self.head_size or k_shape[3] != self.head_size or v_shape[3] != self.head_size:
+            raise ValueError("Cross attention Q/K/V head dimensions must match head_size")
+        if (
+            query.dtype != key.dtype
+            or key.dtype != value.dtype
+            or query.device != key.device
+            or key.device != value.device
+        ):
+            raise ValueError("Cross attention Q/K/V must have the same dtype and device")
+        if attn_metadata is None:
+            return
+        if (
+            attn_metadata.joint_attn_mask is not None
+            or attn_metadata.joint_query is not None
+            or attn_metadata.joint_key is not None
+            or attn_metadata.joint_value is not None
+            or attn_metadata.full_attn_spans is not None
+            or attn_metadata.query_ranges is not None
+            or attn_metadata.video_layout is not None
+            or attn_metadata.packed_padding is not None
+            or attn_metadata.extra
+        ):
+            raise NotImplementedError(
+                "The first cross-attention contract does not support joint, packed, or pair metadata"
+            )
+        if attn_metadata.attn_mask is None:
+            return
+        mask = attn_metadata.attn_mask
+        if self.cross_mask_kind != "kv":
+            raise ValueError("Cross attention requires cross_mask_kind='kv' when an attention mask is supplied")
+        if mask.ndim != 2 or mask.shape != (q_shape[0], k_shape[1]) or mask.dtype != torch.bool:
+            raise ValueError("The first cross-attention mask must be a Boolean KV validity mask of shape [B, KV_len]")
+        if not mask.any(dim=1).all().item():
+            raise ValueError("Each cross-attention batch row must contain at least one valid K/V position")
+        backend_name = self.attn_backend.get_name() if self.attn_backend is not None else None
+        if backend_name != "SDPA" and (backend_name != "FLASH_ATTN" or not current_omni_platform.is_cuda()):
+            raise NotImplementedError(
+                f"KV-only cross-attention masks are verified only for SDPA or CUDA FLASH_ATTN; selected {backend_name}"
+            )
 
     @staticmethod
     def _active_paged_kv_adapter():

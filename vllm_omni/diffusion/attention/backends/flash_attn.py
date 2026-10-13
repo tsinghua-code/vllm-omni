@@ -17,6 +17,7 @@ from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     run_paged_piecewise_plan,
 )
 from vllm_omni.diffusion.attention.capabilities import (
+    AttentionComputation,
     CapabilityResult,
     CompilationMode,
     ExecutionContext,
@@ -250,7 +251,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
-        self.is_cross_attn = role == "cross"
+        computation = extra_impl_args.get("computation", "cross" if role == "cross" else "self")
+        self.is_cross_attn = AttentionComputation(computation) is AttentionComputation.CROSS
         from vllm_omni.diffusion.attention.backends.utils.fa import IS_AITER, IS_FLASH_ATTN_4
 
         self._kernel_variant = "fa4" if IS_FLASH_ATTN_4 else "aiter" if IS_AITER else None
