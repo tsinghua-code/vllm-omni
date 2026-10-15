@@ -1381,7 +1381,8 @@ class LingBotWorldCausalDMDPipeline(
             cache_name=self._AR_TEXT_CACHE,
             kv_branch=self._AR_BRANCH,
             condition_revision=(condition_revision, str(prompt_embeds.device)),
-            projection_revision=(id(self.transformer), self._conditioning_projection_revision),
+            projection_revision=self._conditioning_projection_revision,
+            projection_owner=id(self.transformer),
             representation=ConditioningKVRepresentation(
                 dtype=state.kv_cache.dtype,
                 device=state.kv_cache.device,
@@ -1389,6 +1390,7 @@ class LingBotWorldCausalDMDPipeline(
                 kv_length=prompt_embeds.shape[1],
                 local_heads=cross_attention.num_local_heads,
                 head_size=cross_attention.head_dim,
+                batch_size=prompt_embeds.shape[0],
             ),
         )
         scope = state.conditioning_kv

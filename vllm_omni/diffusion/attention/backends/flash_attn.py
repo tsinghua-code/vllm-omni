@@ -202,6 +202,19 @@ class FlashAttentionBackend(AttentionBackend):
         del attention_spec
         return True
 
+    @classmethod
+    def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        if not current_omni_platform.is_cuda():
+            return False
+        from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
+
+        return flash_attn_varlen_func is not None
+
+    @classmethod
+    def supports_cross_head_geometry(cls, q_heads: int, kv_heads: int) -> bool:
+        return q_heads == kv_heads or (current_omni_platform.is_cuda() and kv_heads > 0 and q_heads % kv_heads == 0)
+
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 96, 128, 192, 256]
